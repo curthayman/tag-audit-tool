@@ -1,35 +1,39 @@
-<<<<<<< HEAD
-# tag-audit-tool
-Streamlit-based HAR analyzer for auditing pre-consent requests, cookies, and tag chains (with diff mode).
-=======
-# HAR File Viewer
+# Tag Audit Tool
 
-A lightweight **Streamlit web app** for inspecting HAR (HTTP Archive) files with a clean, dark-mode UI.  
-It provides **color-coded tables**, category filters, and export options (CSV, Excel, PDF) so you can easily audit web requests — including checking if **JavaScript tags fire before user consent**.
+[![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/) 
+[![Streamlit](https://img.shields.io/badge/Streamlit-App-red.svg)](https://streamlit.io/) 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-![Screenshot](Screenshot 2025-08-26 at 3.10.49 PM.png)
+A **Streamlit-based HAR analyzer** for auditing pre-consent requests, cookies, and tag chains — with **Diff Mode** to isolate what happens when individual tags are enabled.  
+Built for **consent compliance auditing** (GDPR, CCPA) and **GTM tag troubleshooting**.
 
 ---
 
 ## ✨ Features
 
-- 📂 Upload `.har` files (up to 200MB)
-- 🏷️ Automatic request categorization:
-  - **XHR** (AJAX/JSON)
-  - **JS** (JavaScript)
-  - **CSS**
-  - **Img**
-  - **Media**
-  - **Other**
-  - **Errors**
-- 🎨 Color-coded table rows by category (JS = amber, CSS = blue, etc.)
-- 🔍 Filters by category (All, JS, CSS, …)
-- ⏱️ Columns: **Name, Status, Type, Started at, Size, Time, Category**
-- 📊 Export:
-  - **CSV (no colors)**
-  - **Excel (.xlsx, with colored rows + Legend sheet)**
-  - **PDF (colored table + Legend)**
-- 🛡️ Built for **consent compliance auditing** — quickly spot tags that fire pre-consent
+- 📂 **Upload HAR files** (from Chrome, Edge, Firefox DevTools)
+- 🏷️ **Automatic request categorization** with color-coded rows:
+  - **XHR** (purple), **JS** (amber), **CSS** (blue), **Img** (green), **Media** (pink), **Other** (gray), **Errors** (red)
+- 🛡️ **Consent compliance checks**:
+  - Detect pre-consent requests (scripts fired before user action)
+  - Flag policy violations & high-risk activity
+  - Identify cookies dropped before consent
+  - Trace tag chains (e.g., GTM → DoubleClick → Ads)
+- 📊 **Exports**:
+  - CSV (raw requests)
+  - Excel (colored rows + legend tab)
+  - PDF (colored, print-friendly)
+  - Compliance XLSX/PDF (summary reports)
+  - One-page breakdown PDF (executive summary)
+  - Evidence Pack ZIP (HAR + all reports + policy.yml snapshot)
+- 🧩 **Policy.yml support**:
+  - Allow/deny rules for domains, categories, and purposes
+- 🔄 **Diff Mode**:
+  - Compare **Baseline HAR** (tags paused) vs **Test HAR** (one tag enabled)
+  - Export reports showing only what changed:
+    - Requests vs Baseline (Added)
+    - Cookies vs Baseline (Added)
+    - Tag Chains vs Baseline (Added)
 
 ---
 
@@ -37,57 +41,62 @@ It provides **color-coded tables**, category filters, and export options (CSV, E
 
 Clone the repo and install dependencies:
 
-- ```git clone https://github.com/your-org/har-file-viewer.git```
-- ```cd har-file-viewer```
-- ```pip install -r requirements.txt```
-
+```bash
+git clone https://github.com/curthayman/tag-audit-tool.git
+cd tag-audit-tool
+pip install -r requirements.txt
+```
 ## ▶️ Usage
 
 Run the Streamlit app:
 
 ```streamlit run har_viewer.py```
 
-- Then open your browser (default: http://localhost:8501).
-- **1.	Export a HAR from Chrome/Edge/Firefox:**
-DevTools → Network tab → ⋯ menu → Save all as HAR
--	**2.	Upload the .har file in the sidebar**
-- **3. Browse requests, filter by type, and export results**
+Then open your browser (default: http://localhost:8501).
+# Standard Workflow
+1.	Export a HAR
+Chrome/Edge/Firefox → DevTools → Network tab → ⋯ → Save all as HAR
+2. Upload HAR in the sidebar
+3.	Browse requests & violations in the main viewer
+4.	Export reports (CSV, Excel, PDF, Evidence Pack)
+
+# Diff Mode Workflow
+
+For auditing individual GTM tags:
+1.	Pause all tags in GTM → Preview → export HAR → baseline.har
+2.	Enable one tag → Preview → export HAR → tagname.har
+3.	Upload both files in Diff Mode
+4.	Export Diff PDF/XLSX to see only what changed
 
 ## 📂 Project Structure
+
 ```
-.
-├── har_viewer.py      # Main Streamlit app
-├── requirements.txt   # Dependencies
-├── README.md          # Documentation
-└── Screenshot 2025-08-26 at 3.10.49 PM.png     # Example UI screenshot
+├── har_viewer.py        # Main Streamlit app
+├── requirements.txt     # Dependencies
+├── policy.yml           # Example compliance policy
+├── README.md            # Documentation
+└── screenshots/         # Example UI screenshots
 ```
-## 🖼️ Screenshots
+⚖️ Compliance Use Case
 
-## Main Viewer
-**![Screenshot](Screenshot 2025-08-26 at 3.14.27 PM.png)**
+This tool helps companies prove tags are not firing before consent.
+By analyzing HARs pre- and post-consent (or baseline vs test tags), you can generate audit-grade evidence for GDPR/CCPA compliance.
 
-Dark-themed table with filters and category colors.
+✅ Identify violations (red rows)
 
-## Excel Export (colored)
-![Screenshot](excelscreenshot.png)
+✅ Detect cookies set before consent
 
-Rows shaded by request type, with a separate Legend tab.
+✅ Trace tag chains and piggybacking behavior
 
-## PDF Export (colored)
-![Screenshot](pdfscreenshot.png)
-
-Print-friendly report, with legend and full request table.
-
-## ⚖️ Compliance Use Case
-This tool was built to help companies prove they don’t fire tracking tags before consent.
-By analyzing HAR files before and after user interaction with a Consent Management Platform (CMP), you can generate evidence for GDPR/CCPA compliance.
+✅ Export Evidence Pack ZIP for auditors & legal
 
 ## 🔮 Roadmap
-- Pre-consent / post-consent analysis mode
-- Automatic cookie & localStorage detection
-- Domain allow/deny lists for faster audits
-- CLI mode for bulk scanning HAR files
+
+- CLI mode for bulk HAR scanning
+- Cookie diff with expiry/domain insights
+- Visual tag chain graphs
+- Docker & Streamlit Cloud deployment templates
 
 ## 📜 License
+
 MIT License – use freely in your projects.
->>>>>>> b2a4879 (Initial commit: HAR Viewer with compliance & diff mode)
