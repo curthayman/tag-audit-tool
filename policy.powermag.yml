@@ -1,0 +1,42 @@
+allow:
+- ^https?://powermag\.com/.*
+- ^https?://www\.powermag\.com/.*
+- cdn\.jsdelivr\.net
+- cmp\.osano\.com
+- fonts\.googleapis\.com
+- fonts\.gstatic\.com
+block_until_consent:
+- 12891178\.fls\.doubleclick\.net
+- ad\.doubleclick\.net
+- adservice\.google\.com
+- analytics\.google\.com
+- c\.bing\.com
+- c\.clarity\.ms
+- connect\.facebook\.net
+- d\.adroll\.com
+- dc4e793359be9616f26678de89d11d3f\.safeframe\.googlesyndication\.com
+- googleads\.g\.doubleclick\.net
+- js\-agent\.newrelic\.com
+- match\.adsrvr\.org
+- pagead2\.googlesyndication\.com
+- px\.ads\.linkedin\.com
+- s\.adroll\.com
+- securepubads\.g\.doubleclick\.net
+- snap\.licdn\.com
+- static\.doubleclick\.net
+- stats\.g\.doubleclick\.net
+- sync\.outbrain\.com
+- sync\.taboola\.com
+- tpc\.googlesyndication\.com
+- www\.clarity\.ms
+- www\.facebook\.com
+- www\.google\.com
+- www\.googleadservices\.com
+- www\.googletagmanager\.com
+- www\.linkedin\.com
+- x\.adroll\.com
+purpose_overrides: {}
+cookie_overrides: {}
+_generated_for: powermag.com
+_notes: Review allow-list for truly essential-only. Strict mode recommended; CMP should
+  be allowlisted.

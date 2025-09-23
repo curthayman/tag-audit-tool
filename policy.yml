@@ -1,0 +1,125 @@
+# policy.yml — Starter rules for HAR compliance scanner
+# -----------------------------------------------------------------
+# Notes:
+# - Regex patterns (Python-style). Escape dots like "\.".
+# - "allow": always permitted pre-consent (e.g., your first‑party assets, truly essential vendors).
+# - "block_until_consent": vendors that MUST NOT load before consent.
+# - "purpose_overrides": force a Purpose label when inference isn’t enough.
+# - "cookie_overrides": map cookie names to purposes for cookie reporting.
+# - Use with Strict Mode ON to treat all 3P as blocked unless allowlisted.
+#
+# Tip: Start strict, then gradually move essential third‑parties from
+# block_until_consent -> allow after a DPA/legal review.
+# -----------------------------------------------------------------
+
+allow:
+  # === First-party essentials (edit to your domains) ===
+  - '^https?://(www\.)?example\.com/.*'
+  - '^https?://cdn\.examplecdn\.com/.*'
+  - '^https?://assets\.example\.com/.*'
+  # Fonts / critical CDNs you consider essential
+  - '^https?://fonts\.(gstatic|googleapis)\.com/.*'
+  - '^https?://cdnjs\.cloudflare\.com/ajax/libs/.*'
+  - '^https?://cdn\.jsdelivr\.net/.*'
+  # Error logging / uptime you consider essential (review with legal/DPD)
+  # Move these to block_until_consent if you treat them as non-essential.
+  - '^https?://(browser-rum|rum)\.datadoghq\.[a-z\.]+/.*'   # Datadog RUM
+  - '^https?://browser-intake-datadoghq\.[a-z\.]+/.*'
+  - '^https?://browser-intake-newrelic\.com/.*'               # New Relic
+  - '^https?://o[0-9]+\.ingest\.sentry\.io/.*'              # Sentry
+
+block_until_consent:
+  # === Analytics / Measurement ===
+  - 'google-analytics\.com'
+  - 'analytics\.google\.com'
+  - 'stats\.g\.doubleclick\.net'
+  - 'cdn\.segment\.com'
+  - 'segment\.io'
+  - 'mixpanel\.com'
+  - 'plausible\.io'
+  - 'clarity\.ms'
+  - 'snowplow'
+  - 'matomo|piwik'
+  # === Advertising / Retargeting ===
+  - 'doubleclick\.net'
+  - 'googlesyndication\.com'
+  - 'adservice\.google'
+  - 'googleadservices\.com'
+  - 'facebook\.com/tr'
+  - 'connect\.facebook\.net'
+  - 'ads\.linkedin\.com|snap\.licdn\.com'
+  - 'tiktok\.com|ttqcdn\.com'
+  - 'twitter\.com/i/ads|t\.co/i/ads|static\.ads-twitter\.com'
+  - 'bing\.com/.*(uet|bat)'
+  - 'adroll\.com|rlcdn\.com'
+  - 'criteo\.com|bidr\.io'
+  - 'taboola\.com|outbrain\.com'
+  # === Social widgets / tracking ===
+  - 'platform\.twitter\.com'
+  - 'apis\.google\.com/js/platform\.js'
+  - 'staticxx\.facebook\.com'
+  - 'assets\.pinterest\.com'
+  # === Heatmaps / Replay ===
+  - 'hotjar\.com|static\.hotjar\.com|script\.hotjar\.com'
+  - 'fullstory\.com|fs\.js'
+  - 'mouseflow\.com'
+  - 'crazyegg\.com'
+  # === Marketing Automation / CRM ===
+  - 'hubspot\.com|hs-(analytics|scripts)\.com|hscollectedforms\.net|hsforms\.com'
+  - 'pardot\.com|pi\.pardot\.com'
+  - 'marketo\.net|mktoweb\.com'
+  - 'intercom\.io|intercomcdn\.com'
+  - 'drift\.com|js\.driftcdn\.com'
+  - 'braze\.com|cdn\.braze\.eu|sdk\.i10c\.net'
+  - 'onesignal\.com'
+  - 'branch\.io'
+  # === Tag Managers (block container pre‑consent, allow CMP) ===
+  - 'googletagmanager\.com'
+  - 'tealiumiq\.com|tags\.tiqcdn\.com'
+  - 'adobedtm\.com|assets\.adobedtm\.com|adobeexperiencecloud\.com'
+  - 'ensighten\.com'
+
+purpose_overrides:
+  # Force purposes for custom or ambiguous hosts
+  'my-own-analytics\.example\.com': 'Analytics'
+  'pixel\.partnersite\.com': 'Marketing'
+  'log-collector\.example\.com': 'Analytics'
+
+cookie_overrides:
+  # === Google / GA / Ads ===
+  '^_ga($|_|-)': 'Analytics'
+  '^_gid$': 'Analytics'
+  '^_gac_': 'Analytics'
+  '^_gat': 'Analytics'
+  '^_gcl_': 'Marketing'
+  # === Facebook / Meta ===
+  '^_fbp$': 'Marketing'
+  '^fr$': 'Marketing'
+  # === Microsoft / Bing ===
+  '^_uet': 'Marketing'
+  # === LinkedIn ===
+  '^li_': 'Marketing'
+  # === TikTok ===
+  '^tt_': 'Marketing'
+  # === Twitter ===
+  '^twq': 'Marketing'
+  # === Snapchat ===
+  '^scid$': 'Marketing'
+  # === HubSpot ===
+  '^hubspotutk$': 'Marketing'
+  '^__hstc$': 'Marketing'
+  '^__hssc$': 'Marketing'
+  # === Clarity ===
+  '^_clck$': 'Analytics'
+  '^_clsk$': 'Analytics'
+  # === Hotjar ===
+  '^_hj': 'Analytics'
+  # === Segment / Mixpanel ===
+  '^ajs_': 'Analytics'
+  '^mp_': 'Analytics'
+  # === Datadog / NewRelic / Sentry (treat as Analytics unless decided Essential) ===
+  '^_dd_': 'Analytics'
+  '^NRAGENT$': 'Analytics'
+  # === Default fallback patterns ===
+  '^marketing_': 'Marketing'
+  '^analytics_': 'Analytics'

@@ -1,0 +1,18 @@
+# Core app
+streamlit>=1.36.0
+pandas>=2.2.2
+
+# Reports/exports
+reportlab>=4.1.0
+XlsxWriter>=3.2.0
+
+# Policy parsing (YAML)
+PyYAML>=6.0.1
+
+# Common deps (explicit to avoid env quirks)
+numpy>=1.26.0
+python-dateutil>=2.9.0.post0
+pytz>=2024.1
+
+# Images used inside PDFs (ReportLab can benefit from this)
+Pillow>=10.3.0
