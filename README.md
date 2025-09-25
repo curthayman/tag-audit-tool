@@ -53,7 +53,7 @@ cd tag-audit-tool
 pip install -r requirements.txt
 ```
 
-`requirements.txt` (summary): `streamlit`, `pandas`, `numpy`, `python-dateutil`, `pytz`, `reportlab`, `XlsxWriter`, `PyYAML`, `Pillow`.
+````requirements.txt` (summary): `streamlit`, `pandas`, `numpy`, `python-dateutil`, `pytz`, `reportlab`, `XlsxWriter`, `PyYAML`, `Pillow`.```
 
 ---
 
