@@ -1,1400 +1,956 @@
-# har_viewer.py
-# Full-featured HAR viewer & consent compliance scanner with Diff Mode (Differences vs Baseline)
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+HAR Viewer / Tag Audit Tool – consolidated build
+- Single + Diff modes
+- Consent boundary
+- Robust cookies (Set-Cookie, request Cookie, heuristic JS writes)
+- Built-in policy (Google surfaces marked Essential) + toggle
+- Tag Chains + Top Parents
+- CSV / Excel (colored, multi-sheet) / PDF (colored)
+- Hardened initiator/referrer parsing, Chrome HAR cookie warning
+"""
 
 import io
 import json
 import re
-import zipfile
 import string
-from datetime import datetime
-from typing import List, Dict, Any, Tuple
-from urllib.parse import urlparse, parse_qs
+from collections import Counter
+from dataclasses import dataclass
+from functools import lru_cache
+from urllib.parse import urlparse
 
 import pandas as pd
 import streamlit as st
+from dateutil import parser as dateparser
+from pandas.io.formats.style import Styler
 
+# PDF export
 from reportlab.lib import colors
-from reportlab.lib.pagesizes import landscape, A4, letter
+from reportlab.lib.pagesizes import landscape, A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 
-# Excel export engine
-import xlsxwriter  # noqa: F401
-
-# For safe HTML escaping in PDFs
-from html import escape as html_escape
-
-# Optional YAML for policy
-try:
-    import yaml
-except Exception:  # pragma: no cover
-    yaml = None
-
-# -------------------- TOGGLE: Diff Mode (enabled) --------------------
-ENABLE_DIFF_MODE = True
-
-# -------------------- Interpretation Guide --------------------
-INTERPRET_GUIDE = """# Consent Compliance Report – How to Read
-
-This report analyzes a HAR (HTTP Archive) to check whether **scripts, tags, or cookies are firing before user consent** is collected.
-
----
-
-## 1) Status Summary
-- **Total** – number of requests captured in the HAR.
-- **Pre-consent** – how many fired **before** a consent signal was seen.
-- **Violations** – non-essential requests (ads, analytics, marketing, social) that ran before consent.
-- **PASS/FAIL** – fails if any high-risk policy violations were detected.
-
----
-
-## 2) Main Request Table
-- **Seq #** – order of execution (lower = earlier).
-- **Name** – request URL (soft-wrapped in PDFs).
-- **Category** – JS, CSS, Img, XHR, Other, etc.
-- **Purpose** – inferred: Analytics, Ads, Social, Heatmap, Marketing, TagMgr, CMP, Other.
-- **Party** – 1P vs 3P (based on site domain).
-- **PreConsent** – TRUE if fired before consent.
-- **Violation** – TRUE if non-essential + PreConsent=TRUE.
-- **HighRisk** – policy-sensitive (e.g., block_until_consent or strict mode).
-- **Rule** – policy.yml pattern that matched.
-
----
-
-## 3) Violation Colors
-- 🔴 **Red rows** – High-Risk requests that fired **before consent**.
-- 🟢 **Green** – Allowed (post-consent or allowlisted).
-- 🟣 **Purple** – Tag Manager/container scripts (may cascade).
-- ⚫ **Gray** – First-party / essential utilities.
-- Other colors = resource type context (JS/CSS/Img/etc.).
-
----
-
-## 4) Tag Chains
-Who fired what: **Parent (initiator) → Child** with Purpose, Count, PreConsent %, FirstSeq. Use this to prove **piggybacking**.
-
----
-
-## 5) Cookies set before consent
-Cookie name, purpose, domain, first sequence, and times set.
-
----
-
-## 6) Policy (policy.yml)
-- **allow**: strictly necessary allow-list.
-- **block_until_consent**: must not run before consent.
-- **purpose_overrides**: set purpose for URL patterns or hosts.
-- **cookie_overrides**: set purpose for cookie names.
-
----
-
-## 7) Evidence Pack (ZIP)
-All exports, original HAR, tag-chain JSON, cookie dump, and a interpretation guide.
-"""
-
-# -------------------- Categories & colors --------------------
-CATEGORY_ORDER = ["All", "XHR", "JS", "CSS", "Img", "Media", "Other", "Errors", "High-Risk"]
+# =============================== UI CONFIG ===============================
+st.set_page_config(page_title="Tag Audit Tool (HAR Analyzer)", layout="wide")
 
 CATEGORY_COLORS = {
-    "XHR":   "#6D5DD3",
-    "JS":    "#E3B341",
-    "CSS":   "#3BA3FF",
-    "Img":   "#27C2A0",
-    "Media": "#D3558E",
-    "Other": "#7A8898",
-    "Errors":"#E2544B",
+    "JS": "#FFC107",       # amber
+    "CSS": "#42A5F5",      # blue
+    "XHR": "#AB47BC",      # purple
+    "Img": "#66BB6A",      # green
+    "Media": "#EC407A",    # pink
+    "Other": "#B0BEC5",    # gray
+    "Error": "#EF5350",    # red
 }
-FALLBACK_COLOR = "#7A8898"
+VIOLATION_COLOR = "#F44336"        # red (hard violation)
+PRECONSENT_FILL = "#FFE082"        # amber fill for pre-consent but essential (cookies/tag-chains)
 
-PURPOSE_COLORS = {
-    "Analytics": "#34a853",
-    "Ads": "#ea4335",
-    "Social": "#4285f4",
-    "Heatmap": "#fbbc05",
-    "Marketing": "#9c27b0",
-    "TagMgr": "#5e6ad2",
-    "CMP": "#00bcd4",
-    "Other": "#7A8898",
-}
+# =============================== BASIC HELPERS ===============================
+def _host_of(url: str) -> str:
+    try:
+        return urlparse(url).hostname or ""
+    except Exception:
+        return ""
 
-PURPOSE_MAP: Dict[str, List[str]] = {
-    "Analytics": [
-        "google-analytics.com","analytics.google.com","/g/collect","stats.g.doubleclick.net",
-        "clarity.ms","mixpanel.com","cdn.segment.com","segment.io","segment.com","plausible.io",
-        "hs-analytics.net","hs-scripts.com","matomo","quantserve.com","omtrdc.net",
-        "snowplow","newrelic.com","datadoghq","loggly.com","hotjar.com","fullstory.com",
-    ],
-    "Ads": [
-        "doubleclick.net","googlesyndication.com","adservice.google","googleadservices.com",
-        "facebook.com/tr","connect.facebook.net","ads.linkedin.com","snap.licdn.com",
-        "tiktok.com","adsrvr.org","crwdcntrl.net","taboola.com","outbrain.com","adroll.com",
-        "bing.com","bat.bing.com"
-    ],
-    "Social": [
-        "connect.facebook.net","platform.twitter.com","staticxx.facebook.com",
-        "linkedin.com/li/track","snap.licdn.com","instagram.com","assets.pinterest.com"
-    ],
-    "Heatmap": ["hotjar.com","static.hotjar.com","script.hotjar.com","fullstory.com","mouseflow.com","crazyegg.com"],
-    "Marketing": [
-        "hubspot.com","hs-scripts.com","pardot.com","marketo.net","intercom.io",
-        "drift.com","mailchimp.com","onesignal.com","braze.com","branch.io"
-    ],
-    "TagMgr": ["googletagmanager.com","tealiumiq.com","adobedtm.com","ensighten.com","tags.tiqcdn.com","assets.adobedtm.com"],
-    "CMP": ["onetrust","osano","cookiebot","consentmanager","didomi","sourcepoint","trustarc","iubenda","cookieyes","consensu.org"],
-}
+def _etype(entry) -> str:
+    try:
+        mime = (entry.get("response", {}).get("content", {}) or {}).get("mimeType", "")
+        if mime:
+            return mime
+    except Exception:
+        pass
+    try:
+        return entry.get("_resourceType") or entry.get("resourceType") or ""
+    except Exception:
+        return ""
 
-CONSENT_COOKIES = [
-    "OptanonConsent","OptanonAlertBoxClosed","cookieyes-consent","euconsent-v2",
-    "didomi_token","didomi_prefs","sp_consent","sp_choice","cmplz_consent_status",
-    "Osano_consentmanager","osano_consentmanager","cookieconsent_status","cc_cookie",
+def _category(entry) -> str:
+    t = (_etype(entry) or "").lower()
+    url = (entry.get("request", {}) or {}).get("url", "") or ""
+    if "javascript" in t or url.lower().endswith(".js"):
+        return "JS"
+    if "css" in t or url.lower().endswith(".css"):
+        return "CSS"
+    if "image" in t or any(url.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico"]):
+        return "Img"
+    if "audio" in t or "video" in t:
+        return "Media"
+    if "json" in t or "xhr" in t or "fetch" in t:
+        return "XHR"
+    try:
+        if int(entry.get("response", {}).get("status", 200)) >= 400:
+            return "Error"
+    except Exception:
+        pass
+    return "Other"
+
+def estimate_consent_boundary(entries) -> int:
+    # crude heuristic; user can override
+    for i, e in enumerate(entries, start=1):
+        u = (e.get("request", {}) or {}).get("url", "").lower()
+        if any(k in u for k in ["consent", "onetrust", "one-trust", "didomi", "trustarc"]):
+            return max(5, i + 1)
+    return len(entries) + 1
+
+# =============================== BUILT-IN POLICY ===============================
+# Domain rules: tuple(domain_suffix, category, essential)
+DEFAULT_POLICY_DOMAINS: list[tuple[str, str, bool]] = [
+    # Analytics / Tag Manager
+    ("google-analytics.com", "Analytics", True),
+    ("www.google-analytics.com", "Analytics", True),
+    ("analytics.google.com", "Analytics", True),
+    ("googletagmanager.com", "Tag Manager", True),
+    ("www.googletagmanager.com", "Tag Manager", True),
+    ("ssl.google-analytics.com", "Analytics", True),
+    # Google Ads / DoubleClick (per your org policy: treat as Essential)
+    ("doubleclick.net", "Advertising", True),
+    ("googlesyndication.com", "Advertising", True),
+    ("pagead2.googlesyndication.com", "Advertising", True),
+    ("googleadservices.com", "Advertising", True),
+    ("adservice.google.com", "Advertising", True),
+    ("stats.g.doubleclick.net", "Advertising", True),
+    # Platform/static
+    ("gstatic.com", "Platform", True),
+    ("google.com", "Platform", True),
 ]
 
-COOKIE_PURPOSE = {
-    r"(^|_)ga($|_|-)": "Analytics",
-    r"(^|_)gid$": "Analytics",
-    r"(^|_)gac_": "Analytics",
-    r"(^|_)gat": "Analytics",
-    r"(^|_)gcl_": "Marketing",
-    r"(^|_)fbp$": "Marketing",
-    r"(^|_)fr$": "Marketing",
-    r"(^|_)uet": "Marketing",
-    r"(^|_)li_": "Marketing",
-    r"(^|_)tt_": "Marketing",
-    r"(^|_)twq": "Marketing",
-    r"(^|_)scid$": "Marketing",
-    r"(^|_)hubspotutk$": "Marketing",
-    r"(^|_)__hstc$": "Marketing",
-    r"(^|_)__hssc$": "Marketing",
-    r"(^|_)clck$": "Analytics",
-    r"(^|_)clsk$": "Analytics",
-    r"(^|_)hj": "Analytics",
-    r"(^|_)ajs_": "Analytics",
-    r"(^|_)mp_": "Analytics",
-    r"(^|_)dd_": "Analytics",
-    r"(^|_)NRAGENT$": "Analytics",
-}
+# Cookie rules: tuple(cookie_name_or_glob, category, essential)
+DEFAULT_POLICY_COOKIES: list[tuple[str, str, bool]] = [
+    ("_ga", "Analytics", True),
+    ("_ga_*", "Analytics", True),
+    ("_gid", "Analytics", True),
+    ("_gcl_au", "Advertising", True),
+    ("IDE", "Advertising", True),
+    ("1P_JAR", "Advertising", True),
+    ("NID", "Advertising", True),
+    ("SID", "Platform", True),
+    ("HSID", "Platform", True),
+    ("SIDCC", "Platform", True),
+    ("__Secure-*", "Platform", True),
+]
 
-# -------------------- Soft-wrap helper for PDFs (SOFT HYPHEN) --------------------
-def _soft_wrap_text(s: str, max_len: int = 800) -> str:
-    if s is None:
-        return ""
-    s = str(s)
-    SH = "\u00AD"
-    s = re.sub(r"([\/\?\&\=\:\#\.\_\-])", r"\1" + SH, s)
-    s = re.sub(r"([A-Za-z0-9]{12})(?=[A-Za-z0-9])", r"\1" + SH, s)
-    if len(s) > max_len:
-        s = s[: max_len - 1] + "…"
-    s = "".join(ch for ch in s if ord(ch) >= 0x20)
-    return s
+@dataclass(frozen=True)
+class PolicyHit:
+    category: str
+    essential: bool
+    source: str
 
-# -------------------- Helpers --------------------
-def human_size(bytes_val: int) -> str:
-    if bytes_val is None or bytes_val < 0:
-        return "-"
-    units = ["B", "kB", "MB", "GB", "TB"]
-    size = float(bytes_val); i = 0
-    while size >= 1024 and i < len(units) - 1:
-        size /= 1024.0; i += 1
-    return f"{size:.1f}{units[i]}" if i > 0 else f"{int(size)}{units[i]}"
+class Policy:
+    def __init__(self):
+        self.domain_rules: list[tuple[str, str, bool, str]] = []  # (suffix, cat, essential, source)
+        self.cookie_rules: list[tuple[str, str, bool, str]] = []  # (glob, cat, essential, source)
 
-def parse_datetime(dt_str: str) -> Tuple[str, float]:
+    def load_builtins(self, enable=True):
+        if not enable:
+            return
+        for s, c, e in DEFAULT_POLICY_DOMAINS:
+            self.domain_rules.append((s.lower().lstrip("."), c, bool(e), f"builtin:domain:{s}"))
+        for p, c, e in DEFAULT_POLICY_COOKIES:
+            self.cookie_rules.append((p.lower(), c, bool(e), f"builtin:cookie:{p}"))
+
+    @staticmethod
+    def _match_glob(name: str, pattern: str) -> bool:
+        name = (name or "").lower()
+        pattern = (pattern or "").lower()
+        if pattern.endswith("*"):
+            return name.startswith(pattern[:-1])
+        return name == pattern
+
+    @staticmethod
+    def _host(url: str) -> str:
+        try:
+            return urlparse(url).hostname or ""
+        except Exception:
+            return ""
+
+    @lru_cache(maxsize=8192)
+    def classify_url(self, url: str) -> PolicyHit | None:
+        host = self._host(url).lower()
+        for suffix, cat, essential, src in self.domain_rules:
+            if host.endswith(suffix):
+                return PolicyHit(cat, essential, src)
+        return None
+
+    @lru_cache(maxsize=8192)
+    def classify_cookie(self, name: str, domain: str) -> PolicyHit | None:
+        for pat, cat, essential, src in self.cookie_rules:
+            if self._match_glob(name, pat):
+                return PolicyHit(cat, essential, src)
+        d = (domain or "").lower()
+        for suffix, cat, essential, src in self.domain_rules:
+            if d.endswith(suffix):
+                return PolicyHit(cat, essential, src)
+        return None
+
+# =============================== HAR CREATOR WARNING ===============================
+def har_creator(har_json: dict) -> tuple[str, str]:
+    c = (har_json or {}).get("log", {}).get("creator", {}) or {}
+    return str(c.get("name", "") or ""), str(c.get("version", "") or "")
+
+def maybe_warn_har_creator(har_json: dict):
+    name, ver = har_creator(har_json)
+    if not name:
+        return
+    if name.lower().startswith(("chrome", "edge", "chromium")) or "devtools" in name.lower():
+        st.warning(
+            f"This HAR was created by {name} {ver}. Chrome/Edge often redact Cookie headers in HAR. "
+            "Prefer Firefox for full cookie evidence, or capture via a proxy (mitmproxy/Fiddler)."
+        )
+    else:
+        st.caption(f"HAR creator: {name} {ver}")
+
+# =============================== HEADERS / COOKIES ===============================
+def _har_headers(entry, section="response"):
     try:
-        dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
-        ts_ms = dt.timestamp() * 1000.0
-        disp = dt.astimezone().strftime("%I:%M:%S %p").lstrip("0")
-        return disp, ts_ms
+        headers = entry.get(section, {}).get("headers", []) or []
+        out = []
+        for h in headers:
+            if isinstance(h, dict):
+                name = h.get("name") or h.get("Name") or h.get("key") or h.get("Key")
+                value = h.get("value") or h.get("Value") or ""
+                if name is not None:
+                    out.append({"name": str(name), "value": str(value)})
+        return out
     except Exception:
-        return "-", 0.0
+        return []
 
-def infer_category(mime: str, url: str, method: str, status: int) -> str:
-    if isinstance(status, int) and status >= 400:
-        return "Errors"
-    mime = (mime or "").lower()
-    url = (url or "").lower()
-    if "xhr" in mime or "json" in mime:
-        return "XHR"
-    if mime.startswith("text/javascript") or mime.endswith("/javascript") or url.endswith(".js"):
-        return "JS"
-    if mime.startswith("text/css") or url.endswith(".css"):
-        return "CSS"
-    if any(url.endswith(ext) for ext in (".png",".jpg",".jpeg",".gif",".webp",".svg",".ico")) or "image/" in mime:
-        return "Img"
-    if any(x in mime for x in ("video/", "audio/")) or any(ext in url for ext in (".mp4",".webm",".mp3",".wav",".m4a",".mov",".mkv",".ogg",".ogv")):
-        return "Media"
-    return "Other"
-
-def infer_purpose(url: str) -> str:
-    u = (url or "").lower()
-    for purpose, needles in PURPOSE_MAP.items():
-        for n in needles:
-            if n in u:
-                return purpose
-    return "Other"
-
-def host_from_url(url: str) -> str:
+def _iter_set_cookie_values(entry):
+    # Header
+    for h in _har_headers(entry, "response"):
+        if str(h.get("name", "")).lower() == "set-cookie" and h.get("value"):
+            for line in str(h["value"]).replace("\r", "").split("\n"):
+                line = line.strip()
+                if line:
+                    yield line
+    # Structured cookies (some HARs include this)
     try:
-        return urlparse(url).netloc or ""
+        rc = entry.get("response", {}).get("cookies", []) or []
+        for c in rc:
+            name = c.get("name")
+            val = c.get("value", "")
+            if not name:
+                continue
+            parts = [f"{name}={val}"]
+            if c.get("domain"): parts.append(f"Domain={c['domain']}")
+            if c.get("path"): parts.append(f"Path={c['path']}")
+            if c.get("httpOnly"): parts.append("HttpOnly")
+            if c.get("secure"): parts.append("Secure")
+            if c.get("expires"): parts.append(f"Expires={c['expires']}")
+            yield "; ".join(parts)
     except Exception:
-        return ""
+        pass
 
-def parse_set_cookie_headers(res: Dict[str, Any]) -> List[Tuple[str, str]]:
-    out: List[Tuple[str, str]] = []
-    for h in res.get("headers", []) or []:
-        if (h.get("name") or "").lower() != "set-cookie":
-            continue
-        val = h.get("value") or ""
-        m = re.match(r"^\s*([^=;\s]+)\s*=", val)
-        if not m:
-            continue
-        name = m.group(1)
-        mdom = re.search(r"(?i)\bdomain=([^;,\s]+)", val)
-        domain = mdom.group(1) if mdom else ""
-        out.append((name, domain))
-    return out
-
-def collect_response_cookies(res: Dict[str, Any], fallback_host: str) -> List[Tuple[str, str]]:
-    pairs: List[Tuple[str, str]] = []
-    for c in res.get("cookies", []) or []:
-        name = c.get("name") or ""
-        domain = c.get("domain") or fallback_host
-        if name:
-            pairs.append((name, domain))
-    pairs.extend(parse_set_cookie_headers(res))
-    seen = set(); uniq: List[Tuple[str, str]] = []
-    for name, dom in pairs:
-        key = (name, dom or fallback_host)
-        if key in seen: continue
-        seen.add(key)
-        uniq.append((name, dom or fallback_host))
-    return uniq
-
-def classify_cookie(name: str) -> str:
-    for pat, label in COOKIE_PURPOSE.items():
-        if re.search(pat, name, flags=re.I):
-            return label
-    return "Unknown"
-
-def has_gcm_hint(url: str) -> bool:
+def _parse_set_cookie_line(line):
+    # quick parse; resilient to weird attrs
+    name, value, attrs = "", "", {}
     try:
-        q = parse_qs(urlparse(url).query)
-        return any(k in q for k in ("gcs","gcd","npa","gclid"))
+        head = line.split(";", 1)[0]
+        if "=" in head:
+            name, value = head.split("=", 1)
+            name = name.strip(); value = value.strip()
     except Exception:
-        return False
+        pass
+    lower = (line or "").lower()
+    m = re.search(r";\s*domain=([^;]+)", lower)
+    if m: attrs["domain"] = m.group(1).strip()
+    m = re.search(r";\s*path=([^;]+)", lower)
+    if m: attrs["path"] = m.group(1).strip()
+    attrs["secure"] = "secure" in lower
+    attrs["httponly"] = "httponly" in lower
+    return name, value, attrs
 
-def etld1(host: str) -> str:
-    host = (host or "").split(":")[0]
-    parts = host.split(".")
-    return ".".join(parts[-2:]) if len(parts) >= 2 else host
-
-# -------------------- HAR parsing --------------------
-def _initiator_url_from_har(entry: dict) -> str:
+def _iter_request_cookie_names(entry):
     try:
-        init = entry.get("_initiator") or entry.get("initiator") or {}
-        stack = init.get("stack") or {}
-        frames = stack.get("callFrames") or []
-        for cf in frames:
-            u = (cf.get("url") or "").strip()
-            if u and not u.startswith("chrome-extension://"):
-                return u
+        for h in _har_headers(entry, "request"):
+            if str(h.get("name", "")).lower() == "cookie" and h.get("value"):
+                for p in str(h["value"]).split(";"):
+                    p = p.strip()
+                    if "=" in p:
+                        n, _ = p.split("=", 1)
+                        yield n.strip()
+    except Exception:
+        return
+
+def _heuristic_js_cookie_names(entry):
+    # detect `document.cookie="name=...";` or setCookie('name',...)
+    text = (entry.get("response", {}).get("content", {}) or {}).get("text", "") or ""
+    if not text:
+        return []
+    names = set()
+    for m in re.finditer(r"document\s*\.\s*cookie\s*=\s*([\"'])(?P<kv>[^\"']+)\1", text, re.I):
+        kv = m.group("kv")
+        n = kv.split("=", 1)[0].strip()
+        if n:
+            names.add(n)
+    for m in re.finditer(r"\bset[_]?cookie\s*\(\s*([\"'])(?P<name>[^\"']+)\1\s*,", text, re.I):
+        n = m.group("name").strip()
+        if n:
+            names.add(n)
+    return list(names)
+
+# =============================== REQUESTS DF ===============================
+def har_to_df(har_json: dict, policy: Policy, consent_seq: int) -> pd.DataFrame:
+    log = (har_json or {}).get("log", {}) or {}
+    entries = log.get("entries", []) or []
+    rows = []
+    for i, e in enumerate(entries, start=1):
+        req = e.get("request", {}) or {}
+        res = e.get("response", {}) or {}
+        url = req.get("url", "") or ""
+        status = res.get("status", 0) or 0
+        cat = _category(e)
+        # policy
+        hit = policy.classify_url(url)
+        if hit:
+            policy_cat, essential, policy_src = hit.category, hit.essential, hit.source
+        else:
+            # fallback heuristic category; treat non-essential by default
+            policy_cat, essential, policy_src = "Unknown", False, "heuristic"
+
+        pre = i < int(consent_seq)
+        violation = pre and (not essential)
+
+        started = e.get("startedDateTime")
+        if started:
+            try:
+                started = dateparser.parse(started).strftime("%H:%M:%S.%f")[:-3]
+            except Exception:
+                pass
+
+        rows.append({
+            "Seq #": i,
+            "Name": url,
+            "Status": status,
+            "Type": _etype(e) or "",
+            "Category": cat,
+            "PolicyCat": policy_cat,
+            "Essential": essential,
+            "PolicySource": policy_src,
+            "PreConsent": pre,
+            "Violation": violation,
+            "Started at": started or "",
+            "Size": res.get("bodySize", 0) or 0,
+            "Time": (e.get("time") or 0) or 0,
+        })
+    return pd.DataFrame(rows)
+
+# =============================== COOKIES DF (merged sources) ===============================
+def harvest_cookies(har_json: dict, policy: Policy, consent_seq: int) -> pd.DataFrame:
+    entries = (har_json or {}).get("log", {}).get("entries", []) or []
+    rows = []
+    seen = set()  # (name, domain)
+    for idx, e in enumerate(entries, start=1):
+        url = (e.get("request", {}) or {}).get("url", "")
+        host = _host_of(url)
+        # response Set-Cookie
+        for line in _iter_set_cookie_values(e):
+            name, _value, attrs = _parse_set_cookie_line(line)
+            if not name:
+                continue
+            domain = attrs.get("domain") or host
+            hit = policy.classify_cookie(name, domain)
+            if hit:
+                cat, essential, src = hit.category, hit.essential, hit.source
+            else:
+                cat, essential, src = "Unknown", False, "heuristic"
+            key = (name, domain)
+            if key not in seen:
+                seen.add(key)
+                pre = idx < int(consent_seq)
+                rows.append({
+                    "Cookie": name, "Domain": domain,
+                    "PolicyCat": cat, "Essential": essential, "PolicySource": src,
+                    "First Seq #": idx, "Times Set": 1,
+                    "Secure": attrs.get("secure", False), "HttpOnly": attrs.get("httponly", False),
+                    "PreConsent": pre,
+                    "Violation": pre and (not essential),
+                    "Source": "Set-Cookie (response)",
+                })
+    return pd.DataFrame(rows)
+
+def infer_client_cookies(har_json: dict, policy: Policy, consent_seq: int) -> pd.DataFrame:
+    entries = (har_json or {}).get("log", {}).get("entries", []) or []
+    rows, seen = [], set()
+    for idx, e in enumerate(entries, start=1):
+        url = (e.get("request", {}) or {}).get("url", "")
+        host = _host_of(url)
+        for name in _iter_request_cookie_names(e):
+            key = (name, host)
+            if key in seen:
+                continue
+            seen.add(key)
+            hit = policy.classify_cookie(name, host)
+            if hit: cat, essential, src = hit.category, hit.essential, hit.source
+            else:   cat, essential, src = "Unknown", False, "heuristic"
+            pre = idx < int(consent_seq)
+            rows.append({
+                "Cookie": name, "Domain": host,
+                "PolicyCat": cat, "Essential": essential, "PolicySource": src,
+                "First Seq #": idx, "Times Set": 1,
+                "Secure": False, "HttpOnly": False,
+                "PreConsent": pre, "Violation": pre and (not essential),
+                "Source": "Inferred (request)",
+            })
+    return pd.DataFrame(rows)
+
+def infer_js_cookie_writes(har_json: dict, policy: Policy, consent_seq: int) -> pd.DataFrame:
+    entries = (har_json or {}).get("log", {}).get("entries", []) or []
+    rows, seen = [], set()
+    for idx, e in enumerate(entries, start=1):
+        url = (e.get("request", {}) or {}).get("url", "")
+        host = _host_of(url)
+        for name in _heuristic_js_cookie_names(e):
+            key = (name, host)
+            if key in seen:
+                continue
+            seen.add(key)
+            hit = policy.classify_cookie(name, host)
+            if hit: cat, essential, src = hit.category, hit.essential, hit.source
+            else:   cat, essential, src = "Unknown", False, "heuristic"
+            pre = idx < int(consent_seq)
+            rows.append({
+                "Cookie": name, "Domain": host,
+                "PolicyCat": cat, "Essential": essential, "PolicySource": src,
+                "First Seq #": idx, "Times Set": 1,
+                "Secure": False, "HttpOnly": False,
+                "PreConsent": pre, "Violation": pre and (not essential),
+                "Source": "Heuristic (JS)",
+            })
+    return pd.DataFrame(rows)
+
+def dedup(primary: pd.DataFrame, secondary: pd.DataFrame) -> pd.DataFrame:
+    if primary is None or primary.empty:
+        return secondary.copy() if secondary is not None else pd.DataFrame()
+    if secondary is None or secondary.empty:
+        return primary.copy()
+    key = ["Cookie", "Domain"]
+    pkeys = set(map(tuple, primary[key].astype(str).values.tolist()))
+    keep = ~secondary[key].astype(str).apply(tuple, axis=1).isin(pkeys)
+    return pd.concat([primary, secondary.loc[keep]], ignore_index=True)
+
+# =============================== DIFF HELPERS ===============================
+def diff_requests(df_base: pd.DataFrame, df_test: pd.DataFrame) -> pd.DataFrame:
+    if df_test is None or df_test.empty:
+        return pd.DataFrame()
+    if df_base is None or df_base.empty:
+        return df_test.copy()
+    base = set(df_base["Name"].astype(str))
+    mask = ~df_test["Name"].astype(str).isin(base)
+    return df_test.loc[mask].reset_index(drop=True)
+
+def diff_cookies(df_base: pd.DataFrame, df_test: pd.DataFrame) -> pd.DataFrame:
+    if df_test is None or df_test.empty:
+        return pd.DataFrame()
+    if df_base is None or df_base.empty:
+        return df_test.copy()
+    key = ["Cookie", "Domain"]
+    base = set(map(tuple, df_base[key].astype(str).values.tolist()))
+    mask = ~df_test[key].astype(str).apply(tuple, axis=1).isin(base)
+    return df_test.loc[mask].reset_index(drop=True)
+
+# =============================== TAG CHAINS ===============================
+def _har_headers_request(entry):
+    return _har_headers(entry, "request")
+
+def _initiator_url(entry) -> str | None:
+    """Try to pull the parent/initiator URL safely."""
+    init = entry.get("_initiator") or entry.get("initiator")
+    try:
         if isinstance(init, dict):
-            u = (init.get("url") or "").strip()
+            if "url" in init and init["url"]:
+                return init["url"]
+            stack = init.get("stack")
+            # walk devtools stack
+            def walk_stack(s):
+                if not s or not isinstance(s, dict):
+                    return None
+                frames = s.get("callFrames") or []
+                for fr in frames or []:
+                    u = fr.get("url")
+                    if u:
+                        return u
+                frames = s.get("frames") or []
+                for fr in frames or []:
+                    u = fr.get("url")
+                    if u:
+                        return u
+                p = s.get("parent")
+                if p and isinstance(p, dict):
+                    return walk_stack(p)
+                return None
+            u = walk_stack(stack)
             if u:
                 return u
     except Exception:
         pass
-    try:
-        for h in (entry.get("request", {}) or {}).get("headers", []) or []:
-            if (h.get("name") or "").lower() == "referer":
-                v = (h.get("value") or "").strip()
-                if v:
-                    return v
-    except Exception:
-        pass
-    return ""
-
-def extract_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
-    req = entry.get("request", {}) or {}
-    res = entry.get("response", {}) or {}
-    content = res.get("content", {}) or {}
-    mime = content.get("mimeType") or res.get("mimeType") or ""
-    url = req.get("url", "") or ""
-    status = res.get("status", 0)
-    started_str = entry.get("startedDateTime", "") or ""
-    started_disp, started_ms = parse_datetime(started_str)
-
-    body_size = res.get("bodySize", None)
-    transfer_size = res.get("_transferSize", None)
-    content_size = content.get("size", None)
-    size_guess = next((v for v in (transfer_size, body_size, content_size) if isinstance(v, int)), None)
-
-    cat = infer_category(mime, url, req.get("method", ""), status)
-    purpose = infer_purpose(url)
-    host = host_from_url(url)
-
-    initiator_url = _initiator_url_from_har(entry)
-    initiator_host = host_from_url(initiator_url) if initiator_url else ""
-
-    cookie_pairs = collect_response_cookies(res, host)
-    cookie_names = [n for (n, _d) in cookie_pairs]
-
-    return {
-        "Seq #": 0,
-        "Name": url,
-        "Host": host,
-        "InitiatorURL": initiator_url,
-        "InitiatorHost": initiator_host,
-        "Status": status,
-        "Type": mime or "-",
-        "Started at": started_disp,
-        "Started_ms": started_ms,
-        "Size": human_size(size_guess) if size_guess is not None else "-",
-        "Time": f"{int(round(entry.get('time', 0)))}ms",
-        "Category": cat,
-        "Purpose": purpose,
-        "ColorHex": CATEGORY_COLORS.get(cat, FALLBACK_COLOR),
-        "PurposeColor": PURPOSE_COLORS.get(purpose, PURPOSE_COLORS["Other"]),
-        "HasConsentCookie": any((n in CONSENT_COOKIES) for n in cookie_names),
-        "CookiesSet": cookie_pairs,
-        "CookiesSetNames": ";".join(cookie_names),
-        "CookiePurposeHint": ";".join(sorted({classify_cookie(n) for n in cookie_names if n})),
-        "ConsentModeHint": has_gcm_hint(url),
-        "RawTimeMs": entry.get("time", 0),
-        "SizeBytes": size_guess if (isinstance(size_guess, int) and size_guess >= 0) else None,
-        "Started_ts": started_str,
-    }
-
-def har_to_df(har_obj: Dict[str, Any]) -> pd.DataFrame:
-    entries = (har_obj or {}).get("log", {}).get("entries", []) or []
-    rows = [extract_entry(e) for e in entries]
-    df = pd.DataFrame(rows)
-    if len(df):
-        df = df.sort_values(by=["Started_ms","RawTimeMs"], kind="stable").reset_index(drop=True)
-        df["Seq #"] = range(1, len(df) + 1)
-    return df
-
-# -------------------- Site domain, party, filters --------------------
-def site_domain_from_har(df: pd.DataFrame) -> str:
-    try:
-        from urllib.parse import urlparse as _u
-        htmls = df[(df["Status"] == 200) & df["Type"].str.contains("text/html", na=False)]
-        if len(htmls):
-            return etld1(_u(htmls.iloc[0]["Name"]).netloc)
-        return etld1(_u(df.iloc[0]["Name"]).netloc)
-    except Exception:
-        return ""
-
-def mark_party(df: pd.DataFrame) -> pd.DataFrame:
-    dom = site_domain_from_har(df)
-    df = df.copy()
-    def _party(h: str) -> str:
-        if not dom:
-            return "Unknown"
-        return "1P" if etld1(h).endswith(dom) else "3P"
-    df["Party"] = df["Host"].apply(_party)
-    return df
-
-def filter_df(df: pd.DataFrame, category: str) -> pd.DataFrame:
-    if category == "All":
-        return df
-    if category == "High-Risk":
-        return df[df["HighRisk"] == True]  # noqa: E712
-    return df[df["Category"] == category]
-
-# -------------------- Consent window & flags --------------------
-def detect_consent_time_ms(df: pd.DataFrame) -> Tuple[bool, float]:
-    consent_rows = df[df["HasConsentCookie"] == True]  # noqa: E712
-    if len(consent_rows):
-        return True, float(consent_rows["Started_ms"].min())
-    return False, float("inf")
-
-def mark_preconsent(df: pd.DataFrame, assume_no_consent_if_unknown: bool) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    df = df.copy()
-    found, consent_ms = detect_consent_time_ms(df)
-    page_start_ms = float(df["Started_ms"].min()) if len(df) else 0.0
-    if not found:
-        df["PreConsent"] = True if assume_no_consent_if_unknown else False
-    else:
-        df["PreConsent"] = df["Started_ms"] < consent_ms
-    non_essential = df["Purpose"].isin(["Analytics","Ads","Social","Heatmap","Marketing"])
-    df["Violation"] = df["PreConsent"] & non_essential
-    meta = {
-        "has_consent": found,
-        "consent_ms": None if not found else consent_ms,
-        "page_start_ms": page_start_ms,
-        "preconsent_window_ms": None if not found else max(0, consent_ms - page_start_ms),
-    }
-    return df, meta
-
-# -------------------- Rules engine --------------------
-DEFAULT_RULES = {
-    "allow": [],
-    "block_until_consent": [],
-    "purpose_overrides": {},
-    "cookie_overrides": {},
-}
-
-def load_rules_from_text(text: str) -> Dict[str, Any]:
-    if not yaml:
-        return DEFAULT_RULES.copy()
-    try:
-        data = yaml.safe_load(text) or {}
-        for k in DEFAULT_RULES:
-            data.setdefault(k, DEFAULT_RULES[k])
-        return data
-    except Exception:
-        return DEFAULT_RULES.copy()
-
-def match_any(url: str, patterns: List[str]) -> str | None:
-    for pat in patterns or []:
-        try:
-            if re.search(pat, url, flags=re.I):
-                return pat
-        except re.error:
-            continue
+    # referer header fallback
+    for h in _har_headers_request(entry):
+        if str(h.get("name", "")).lower() == "referer" and h.get("value"):
+            return h["value"]
     return None
 
-def apply_policy(df: pd.DataFrame, rules: Dict[str, Any], strict_mode: bool) -> pd.DataFrame:
-    df = df.copy()
+def build_tag_chains(har_json: dict, df_requests: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build a parent→child table using initiator/referrer signals.
+    Looks up children against df_requests by BOTH full URL and host, so
+    we can still classify even if one side uses host-only and the other uses full URL.
+    """
+    entries = (har_json or {}).get("log", {}).get("entries", []) or []
 
-    # Purpose overrides for requests
-    for pat, purpose in (rules.get("purpose_overrides") or {}).items():
-        try:
-            mask = df["Name"].str.contains(pat, case=False, regex=True, na=False)
-            df.loc[mask, "Purpose"] = purpose
-        except re.error:
+    # Build a map we can hit by URL and by host
+    req_by_key: dict[str, pd.Series] = {}
+    for _, r in df_requests.iterrows():
+        url = str(r.get("Name", ""))
+        if not url:
+            continue
+        host = _host_of(url) or ""
+        req_by_key[url] = r
+        if host:
+            req_by_key[host] = r  # allow host lookups
+
+    rows = []
+    for e in entries:
+        child_url = (e.get("request", {}) or {}).get("url", "")
+        if not child_url:
             continue
 
-    # Cookie purpose overrides
-    if "cookie_overrides" in rules:
-        def _cookie_hint(names: str) -> str:
-            parts = (names or "").split(";")
-            labels = set()
-            for n in parts:
-                n = n.strip()
-                if not n: continue
-                lab = None
-                for pat, pv in rules["cookie_overrides"].items():
-                    try:
-                        if re.search(pat, n, flags=re.I):
-                            lab = pv; break
-                    except re.error:
-                        continue
-                if not lab:
-                    lab = classify_cookie(n)
-                labels.add(lab)
-            return ";".join(sorted([l for l in labels if l]))
-        df["CookiePurposeHint"] = df["CookiesSetNames"].apply(_cookie_hint)
-
-    hit_allow = df["Name"].apply(lambda u: match_any(u, rules.get("allow")))
-    hit_block = df["Name"].apply(lambda u: match_any(u, rules.get("block_until_consent")))
-
-    df["Rule"] = hit_allow.combine_first(hit_block).fillna("")
-
-    # HighRisk:
-    df["HighRisk"] = (
-        (df["PreConsent"] & hit_block.notna()) |
-        (strict_mode & df["PreConsent"] & (df["Party"] == "3P") & hit_allow.isna())
-    )
-
-    # Allowed:
-    df["Allowed"] = (
-        hit_allow.notna() |
-        (~df["PreConsent"]) |
-        (hit_block.isna() & (~(strict_mode & (df["Party"] == "3P"))))
-    )
-    return df
-
-# -------------------- Cookies (pre-consent summary) --------------------
-def preconsent_cookie_summary(df: pd.DataFrame) -> pd.DataFrame:
-    rows = []
-    seen_first: Dict[Tuple[str, str], Tuple[int, float]] = {}
-    counts: Dict[Tuple[str, str], int] = {}
-    purposes: Dict[Tuple[str, str], str] = {}
-
-    for _, r in df[df["PreConsent"] == True].iterrows():  # noqa: E712
-        pairs: List[Tuple[str, str]] = r.get("CookiesSet", []) or []
-        for name, dom in pairs:
-            if not name: continue
-            if name in CONSENT_COOKIES:
-                continue
-            key = (name, dom or r.get("Host", ""))
-            counts[key] = counts.get(key, 0) + 1
-            if key not in seen_first or r["Started_ms"] < seen_first[key][1]:
-                seen_first[key] = (int(r["Seq #"]), r["Started_ms"])
-            purposes[key] = purposes.get(key, classify_cookie(name))
-
-    out = []
-    for (name, dom), cnt in sorted(counts.items(), key=lambda x: (x[0][0].lower(), x[0][1])):
-        seq = seen_first[(name, dom)][0] if (name, dom) in seen_first else ""
-        out.append({"Cookie": name, "Purpose": purposes.get((name, dom), "Unknown"), "First Seq #": seq, "Domain": dom, "Times Set": cnt})
-    return pd.DataFrame(out)
-
-# -------------------- Tag Chains --------------------
-def build_tag_graph(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    rows = []
-    for _, r in df.iterrows():
-        parent = (r.get("InitiatorHost") or "").strip()
-        child = (r.get("Host") or "").strip()
-        if not parent or not child:
+        parent_url = _initiator_url(e)
+        if not parent_url:
             continue
+
+        # Try exact URL first, then host fallback
+        child = req_by_key.get(child_url)
+        if child is None:
+            child = req_by_key.get(_host_of(child_url) or "")
+
+        if child is None:
+            # Not in the filtered df; still emit a minimal row (unclassified)
+            rows.append({
+                "Parent": _host_of(parent_url) or parent_url,
+                "Child": _host_of(child_url) or child_url,
+                "PolicyCat": "Unknown",
+                "Essential": False,
+                "PreConsent": False,
+                "Violation": False,
+                "FirstSeqChild": None,
+            })
+            continue
+
+        # child is a Series (a row from df_requests)
         rows.append({
-            "Parent": parent,
-            "Child": child,
-            "Seq #": int(r["Seq #"]),
-            "PreConsent": bool(r["PreConsent"]),
-            "Purpose": r.get("Purpose") or "Other"
+            "Parent": _host_of(parent_url) or parent_url,
+            "Child": _host_of(child_url) or child_url,
+            "PolicyCat": child.get("PolicyCat", "Unknown"),
+            "Essential": bool(child.get("Essential", False)),
+            "PreConsent": bool(child.get("PreConsent", False)),
+            "Violation": bool(child.get("Violation", False)),
+            "FirstSeqChild": int(child.get("Seq #", 0) or 0),
         })
 
-    edges_df = pd.DataFrame(rows)
-    if edges_df.empty:
-        return edges_df, edges_df
+    if not rows:
+        return pd.DataFrame(columns=[
+            "Parent", "Child", "PolicyCat", "Essential", "PreConsent", "Violation", "FirstSeqChild"
+        ])
 
-    agg = (
-        edges_df
-        .assign(PreConsentCount=lambda d: d["PreConsent"].astype(int))
-        .groupby(["Parent", "Child", "Purpose"], as_index=False)
-        .agg(Count=("Child", "size"), PreConsent=("PreConsentCount", "sum"), FirstSeq=("Seq #", "min"))
-        .sort_values(["PreConsent", "Count", "FirstSeq"], ascending=[False, False, True])
-    )
-    return edges_df, agg
+    df = pd.DataFrame(rows)
+    df = df.sort_values(
+        ["Violation", "PreConsent", "Parent", "Child"],
+        ascending=[False, False, True, True]
+    ).reset_index(drop=True)
+    return df
 
-# -------------------- PDF helpers --------------------
-def _pdf_cell_style(styles):
-    return ParagraphStyle(
-        "cell",
-        parent=styles["BodyText"],
-        fontSize=8,
-        leading=11,
-        spaceAfter=0,
-        spaceBefore=0,
-        wordWrap="CJK",
-        allowWidowsOrphans=1,
-        splitLongWords=True,
-    )
+def top_parents_summary(tag_chains_df: pd.DataFrame) -> pd.DataFrame:
+    if tag_chains_df is None or tag_chains_df.empty:
+        return pd.DataFrame(columns=["Parent","Count","PreConsent","Violations","FirstSeqMin"])
+    agg = (tag_chains_df
+           .groupby("Parent")
+           .agg(Count=("Child","count"),
+                PreConsent=("PreConsent","sum"),
+                Violations=("Violation","sum"),
+                FirstSeqMin=("FirstSeqChild","min"))
+           .reset_index()
+           .sort_values(["Violations","PreConsent","Count"], ascending=[False,False,False]))
+    return agg
 
-# -------------------- Exports: Generic PDF --------------------
-def make_pdf(df: pd.DataFrame, title: str = "HAR Table Export") -> bytes:
-    buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=landscape(A4), leftMargin=24, rightMargin=24, topMargin=24, bottomMargin=24)
-    styles = getSampleStyleSheet(); cell_style = _pdf_cell_style(styles)
-    elems: List[Any] = []
+# =============================== STYLING ===============================
+def _hex_to_rgb(hex_color: str):
+    h = hex_color.lstrip("#")
+    if len(h) == 3:
+        h = "".join(ch*2 for ch in h)
+    r = int(h[0:2], 16); g = int(h[2:4], 16); b = int(h[4:6], 16)
+    return r, g, b
 
-    elems.append(Paragraph(title, styles["Heading2"]))
-    elems.append(Spacer(1, 6))
+def _contrast_text_for(bg_hex: str) -> str:
+    try:
+        r, g, b = _hex_to_rgb(bg_hex)
+        lum = 0.2126*(r/255) + 0.7152*(g/255) + 0.0722*(b/255)
+        return "#000000" if lum > 0.6 else "#FFFFFF"
+    except Exception:
+        return "#000000"
 
-    legend_data = [["Category", "Color"]] + [[c, ""] for c in ["XHR","JS","CSS","Img","Media","Other","Errors"]]
-    legend = Table(legend_data, colWidths=[80, 60])
-    ts = TableStyle([
+def color_for_row(row):
+    if row.get("Violation", False):
+        return VIOLATION_COLOR
+    return CATEGORY_COLORS.get(str(row.get("Category","")), "#ECEFF1")
+
+def style_dataframe(df: pd.DataFrame) -> Styler:
+    if df.empty:
+        return df.style
+    def style_rows(s: pd.Series):
+        bg = color_for_row(s.to_dict())
+        fg = _contrast_text_for(bg)
+        return [f"background-color: {bg}; color: {fg};"] * len(s)
+    return df.style.apply(style_rows, axis=1)
+
+# =============================== EXPORTS ===============================
+def to_csv_bytes(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False).encode("utf-8")
+
+def _safe_sheet(name: str) -> str:
+    bad = set('[]:*?/\\')
+    safe = "".join('_' if ch in bad else ch for ch in (name or "Sheet"))
+    safe = safe.strip().strip("'")
+    return safe[:31] or "Sheet"
+
+def to_xlsx_bytes(df: pd.DataFrame,
+                  cookies: pd.DataFrame | None,
+                  tag_chains: pd.DataFrame | None,
+                  top_parents: pd.DataFrame | None,
+                  title="HAR Export") -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter", engine_kwargs={"options":{"strings_to_urls": False}}) as writer:
+        wb = writer.book
+        header_fmt = wb.add_format({"bold": True, "bg_color": "#000000", "font_color":"#FFFFFF"})
+
+        # HAR sheet
+        sh = _safe_sheet("HAR")
+        df.to_excel(writer, sheet_name=sh, index=False, startrow=1)
+        ws = writer.sheets[sh]
+        ws.write(0, 0, title, wb.add_format({"bold": True}))
+        for i, col in enumerate(df.columns):
+            ws.write(1, i, col, header_fmt)
+        widths = {"Seq #":8,"Name":90,"Status":10,"Type":28,"Category":12,"PolicyCat":16,"Essential":10,
+                  "PreConsent":12,"Violation":10,"Started at":16,"Size":10,"Time":10,"PolicySource":18}
+        for i, col in enumerate(df.columns):
+            ws.set_column(i, i, widths.get(col, 14))
+        # row fills
+        for r in range(2, 2+len(df)):
+            viol = bool(df.iloc[r-2].get("Violation", False))
+            bg = VIOLATION_COLOR if viol else CATEGORY_COLORS.get(df.iloc[r-2].get("Category",""), "#ECEFF1")
+            ws.set_row(r, None, wb.add_format({"bg_color": bg}))
+
+        # Legend
+        leg = _safe_sheet("Legend")
+        ws2 = wb.add_worksheet(leg)
+        ws2.write_row(0, 0, ["Key", "Color / Meaning"])
+        i = 1
+        for k, v in CATEGORY_COLORS.items():
+            ws2.write_row(i, 0, [k, v])
+            ws2.set_row(i, None, wb.add_format({"bg_color": v}))
+            i += 1
+        ws2.write_row(i+1, 0, ["Violation rows", VIOLATION_COLOR])
+        ws2.set_row(i+1, None, wb.add_format({"bg_color": VIOLATION_COLOR}))
+        ws2.write_row(i+2, 0, ["Pre-consent (Essential)", PRECONSENT_FILL])
+        ws2.set_row(i+2, None, wb.add_format({"bg_color": PRECONSENT_FILL}))
+
+        # Cookies
+        if cookies is not None and not cookies.empty:
+            csh = _safe_sheet("Cookies - Summary")
+            cookies.to_excel(writer, sheet_name=csh, index=False, startrow=1)
+            ws3 = writer.sheets[csh]
+            for i, col in enumerate(cookies.columns):
+                ws3.write(1, i, col, header_fmt)
+            cwidths = {"Cookie":34,"Domain":44,"PolicyCat":16,"Essential":10,"First Seq #":12,
+                       "Times Set":12,"Secure":10,"HttpOnly":10,"PreConsent":12,"Violation":10,"Source":18,"PolicySource":18}
+            for i, col in enumerate(cookies.columns):
+                ws3.set_column(i, i, cwidths.get(col, 16))
+            # color: red violations; amber for pre-consent (essential)
+            for r in range(2, 2+len(cookies)):
+                row = cookies.iloc[r-2]
+                if bool(row.get("Violation", False)):
+                    ws3.set_row(r, None, wb.add_format({"bg_color": VIOLATION_COLOR}))
+                elif bool(row.get("PreConsent", False)):
+                    ws3.set_row(r, None, wb.add_format({"bg_color": PRECONSENT_FILL}))
+
+        # Tag Chains
+        if tag_chains is not None and not tag_chains.empty:
+            tsh = _safe_sheet("Tag Chains")
+            tag_chains.to_excel(writer, sheet_name=tsh, index=False, startrow=1)
+            ws4 = writer.sheets[tsh]
+            for i, col in enumerate(tag_chains.columns):
+                ws4.write(1, i, col, header_fmt)
+            twidths = {"Parent":34,"Child":44,"PolicyCat":16,"Essential":10,"PreConsent":12,"Violation":10,"FirstSeqChild":12}
+            for i, col in enumerate(tag_chains.columns):
+                ws4.set_column(i, i, twidths.get(col, 16))
+            for r in range(2, 2+len(tag_chains)):
+                row = tag_chains.iloc[r-2]
+                if bool(row.get("Violation", False)):
+                    ws4.set_row(r, None, wb.add_format({"bg_color": VIOLATION_COLOR}))
+                elif bool(row.get("PreConsent", False)):
+                    ws4.set_row(r, None, wb.add_format({"bg_color": PRECONSENT_FILL}))
+
+        # Top Parents
+        if top_parents is not None and not top_parents.empty:
+            psh = _safe_sheet("Top Parents")
+            top_parents.to_excel(writer, sheet_name=psh, index=False, startrow=1)
+            ws5 = writer.sheets[psh]
+            for i, col in enumerate(top_parents.columns):
+                ws5.write(1, i, col, header_fmt)
+            ws5.set_column(0, 0, 34)
+            ws5.set_column(1, 1, 10)
+            ws5.set_column(2, 2, 12)
+            ws5.set_column(3, 3, 12)
+            ws5.set_column(4, 4, 12)
+    return output.getvalue()
+
+# PDF helpers
+_ZWSP = "\u200b"
+def _soft_wrap_text(s: str, max_len: int = 1200) -> str:
+    if s is None:
+        return ""
+    s = str(s)
+    if len(s) > max_len:
+        s = s[: max_len - 1] + "…"
+    s = re.sub(r"([\/\?\&\=\.\:\-\_\~\#\,])", r"\1" + _ZWSP, s)
+    s = re.sub(r"([A-Fa-f0-9]{20})(?=[A-Fa-f0-9])", r"\1" + _ZWSP, s)
+    s = "".join(ch for ch in s if ch in string.printable or ord(ch) >= 0x20)
+    return s
+
+def _pdf_table(data, col_widths):
+    tbl = Table(data, repeatRows=1, colWidths=col_widths)
+    tbl.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,0), colors.black),
         ("TEXTCOLOR", (0,0), (-1,0), colors.white),
         ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
         ("FONTSIZE", (0,0), (-1,0), 9),
-        ("BOX", (0,0), (-1,-1), 0.25, colors.HexColor("#2A2F34")),
-        ("GRID", (0,0), (-1,-1), 0.25, colors.HexColor("#2A2F34")),
-        ("FONTSIZE", (0,1), (-1,-1), 8),
-    ])
-    for i, cat in enumerate(["XHR","JS","CSS","Img","Media","Other","Errors"], start=1):
-        ts.add("BACKGROUND", (1,i), (1,i), colors.HexColor(CATEGORY_COLORS.get(cat, FALLBACK_COLOR)))
-    legend.setStyle(ts)
-    elems.append(legend)
-    elems.append(Spacer(1, 10))
-
-    cols = ["Seq #","Name","Status","Type","Started at","Size","Time","Category","Purpose","Party","PreConsent","Violation","HighRisk","Rule"]
-    data = [cols]
-    for _, row in df[cols].iterrows():
-        data.append([
-            str(row["Seq #"]),
-            Paragraph(html_escape(_soft_wrap_text(row["Name"])), cell_style),
-            str(row["Status"]),
-            Paragraph(html_escape(_soft_wrap_text(row["Type"], max_len=200)), cell_style),
-            str(row["Started at"]),
-            str(row["Size"]),
-            str(row["Time"]),
-            str(row["Category"]),
-            str(row["Purpose"]),
-            str(row["Party"]),
-            str(row["PreConsent"]),
-            str(row["Violation"]),
-            str(row["HighRisk"]),
-            str(row["Rule"]),
-        ])
-
-    col_widths = [36, None, 42, 56, 56, 44, 44, 56, 58, 36, 56, 44, 44, 56]
-    table = Table(data, repeatRows=1, colWidths=col_widths)
-    base = TableStyle([
-        ("BACKGROUND", (0,0), (-1,0), colors.black),
-        ("TEXTCOLOR", (0,0), (-1,0), colors.white),
-        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
-        ("FONTSIZE", (0,0), (-1,0), 10),
         ("GRID", (0,0), (-1,-1), 0.25, colors.HexColor("#2A2F34")),
         ("FONTSIZE", (0,1), (-1,-1), 8),
         ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
         ("LEFTPADDING", (0,0), (-1,-1), 6),
         ("RIGHTPADDING", (0,0), (-1,-1), 6),
-        ("ALIGN", (0,1), (0,-1), "CENTER"),
-        ("LEFTPADDING", (0,1), (0,-1), 4),
-        ("RIGHTPADDING", (0,1), (0,-1), 4),
-        ("TEXTCOLOR", (0,1), (-1,-1), colors.HexColor("#0b0f14")),
-    ])
-    for i, cat in enumerate(df["Category"].tolist(), start=1):
-        base.add("BACKGROUND", (0,i), (-1,i), colors.HexColor(CATEGORY_COLORS.get(cat, FALLBACK_COLOR)))
-    table.setStyle(base)
+    ]))
+    return tbl
 
-    elems.append(table)
-    doc.build(elems)
-    buf.seek(0)
-    return buf.read()
-
-# -------------------- Exports: Excel (colored) --------------------
-def make_xlsx(df: pd.DataFrame, title: str = "HAR Export") -> bytes:
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter", engine_kwargs={"options": {"strings_to_urls": False}}) as writer:
-        cols = ["Seq #","Name","Status","Type","Started at","Size","Time","Category","Purpose","Party","PreConsent","Violation","HighRisk","Rule","CookiesSetNames"]
-        df_x = df[cols].copy()
-
-        def _trim_cell(val, lim=32760):
-            if isinstance(val, str) and len(val) > lim:
-                return val[:lim - 1] + "…"
-            return val
-        for c in df_x.select_dtypes(include="object").columns:
-            df_x[c] = df_x[c].map(_trim_cell)
-
-        df_x.to_excel(writer, sheet_name="HAR", index=False, startrow=1)
-        wb = writer.book; ws = writer.sheets["HAR"]
-
-        title_fmt = wb.add_format({"bold": True, "font_size": 14})
-        ws.write(0, 0, title, title_fmt)
-
-        header_fmt = wb.add_format({"bold": True, "bg_color": "#000000", "font_color": "#FFFFFF", "border": 1})
-        for i, col in enumerate(df_x.columns):
-            ws.write(1, i, col, header_fmt)
-
-        widths = [8, 90, 8, 24, 14, 10, 10, 12, 14, 8, 12, 10, 10, 24, 26]
-        for i, w in enumerate(widths):
-            ws.set_column(i, i, w)
-
-        ws.freeze_panes(2, 0)
-        ws.autofilter(1, 0, 1 + len(df_x), len(df_x.columns) - 1)
-
-        # Row coloring
-        wb_fmt_cache = {}
-        def fmt_for(cat: str):
-            if cat not in wb_fmt_cache:
-                wb_fmt_cache[cat] = wb.add_format({"bg_color": CATEGORY_COLORS.get(cat, FALLBACK_COLOR), "font_color": "#0b0f14"})
-            return wb_fmt_cache[cat]
-        start_row = 2
-        for r, cat in enumerate(df["Category"].tolist()):
-            ws.set_row(start_row + r, None, fmt_for(cat))
-
-        # Legend
-        legend = wb.add_worksheet("Legend")
-        legend.write_row(0, 0, ["Category", "Color"], header_fmt)
-        for i, cat in enumerate(["XHR","JS","CSS","Img","Media","Other","Errors"], start=1):
-            legend.write(i, 0, cat)
-            cell_fmt = wb.add_format({"bg_color": CATEGORY_COLORS.get(cat, FALLBACK_COLOR)})
-            legend.write(i, 1, "", cell_fmt)
-        legend.set_column(0, 0, 16); legend.set_column(1, 1, 12)
-
-        # Tag Chains sheet (Top 15)
-        try:
-            edges_df, chains = build_tag_graph(df)
-            if chains.empty:
-                pd.DataFrame([{"Info": "No initiator information found in HAR."}]).to_excel(
-                    writer, sheet_name="Tag Chains", index=False
-                )
-            else:
-                cols_tc = ["Parent", "Child", "Purpose", "Count", "PreConsent", "FirstSeq"]
-                top_tc = chains[cols_tc].head(15)
-                top_tc.to_excel(writer, sheet_name="Tag Chains", index=False)
-
-                ws_tc = writer.sheets["Tag Chains"]
-                header_fmt2 = wb.add_format({"bold": True, "bg_color": "#000000", "font_color": "#FFFFFF", "border": 1})
-                for i, col in enumerate(cols_tc):
-                    ws_tc.write(0, i, col, header_fmt2)
-
-                ws_tc.set_column(0, 0, 40)
-                ws_tc.set_column(1, 1, 44)
-                ws_tc.set_column(2, 2, 14)
-                ws_tc.set_column(3, 5, 12)
-        except Exception:
-            pass
-
-    output.seek(0)
-    return output.read()
-
-# -------------------- Compliance summary & One-Pager --------------------
-def compliance_summary(df: pd.DataFrame, meta: Dict[str, Any]) -> Dict[str, Any]:
-    total = len(df)
-    pre = int(df["PreConsent"].sum())
-    violations = df[df["Violation"] == True]  # noqa: E712
-    highrisk = df[df["HighRisk"] == True]     # noqa: E712
-    vcount = len(violations); hcount = len(highrisk)
-    status = "PASS" if hcount == 0 else "FAIL"
-
-    top_domains = (
-        highrisk["Name"].str.extract(r"^(?:https?://)?([^/]+)", expand=False)
-        .fillna("").value_counts().head(10).to_dict()
-    )
-    purpose_counts = highrisk["Purpose"].value_counts().to_dict()
-    third_party_pre = df[(df["PreConsent"] == True) & (df["Party"] == "3P")]  # noqa: E712
-    third_by_domain = third_party_pre["Host"].value_counts().head(15).to_dict()
-
-    return {
-        "total_requests": total,
-        "preconsent_requests": pre,
-        "violation_count": vcount,
-        "highrisk_count": hcount,
-        "status": status,
-        "top_highrisk_domains": top_domains,
-        "highrisk_purposes": purpose_counts,
-        "preconsent_3p_domains": third_by_domain,
-        "consent_window_ms": meta.get("preconsent_window_ms"),
-        "has_consent": meta.get("has_consent"),
-    }
-
-def make_breakdown_pdf(summary: dict) -> bytes:
+def to_pdf_bytes(df: pd.DataFrame, cookies_df: pd.DataFrame | None, title="HAR Export – Report") -> bytes:
     buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=letter,
-                            leftMargin=36, rightMargin=36,
-                            topMargin=36, bottomMargin=36)
+    doc = SimpleDocTemplate(buf, pagesize=landscape(A4),
+                            leftMargin=24, rightMargin=24, topMargin=24, bottomMargin=24)
     styles = getSampleStyleSheet()
+    cell_style = ParagraphStyle("cell", parent=styles["BodyText"], fontSize=8, leading=11, wordWrap="CJK", splitLongWords=True)
+
     elems = []
-
-    status = summary.get("status", "UNKNOWN")
-    color = "red" if status == "FAIL" else "green"
-    window = summary.get("consent_window_ms")
-    window_txt = "Unknown" if window is None else f"{window/1000:.2f}s"
-
-    text = f"""
-    <b>Compliance Report – One Page Breakdown</b>
-
-    <b>Overall Verdict:</b> Status = <font color="{color}">{status}</font>
-
-    <b>Key Numbers:</b>
-    - Total requests: {summary.get('total_requests')}
-    - Pre-consent requests: {summary.get('preconsent_requests')}
-    - Violations (generic): {summary.get('violation_count')}
-    - High-Risk (policy): {summary.get('highrisk_count')}
-    - Pre-consent window: {window_txt}
-
-    <b>Interpretation:</b>
-    Non-essential requests that fired before consent are flagged. High-Risk are policy-flagged pre-consent requests.
-
-    <b>Sheets included:</b>
-    - High-Risk, PreConsent Cookies, Tag Chains.
-
-    <b>Next Steps:</b>
-    - Block Tag Manager/marketing/analytics until consent.
-    - Use Consent Mode (ad_storage='denied', analytics_storage='denied').
-    - Retest aiming for Status = PASS with 0 High-Risk.
-    """
-    for para in text.strip().split("\n\n"):
-        elems.append(Paragraph(para.strip(), styles["Normal"]))
-        elems.append(Spacer(1, 12))
-
-    doc.build(elems)
-    buf.seek(0)
-    return buf.read()
-
-# -------------------- Compliance PDF --------------------
-def make_report_pdf(df: pd.DataFrame, meta: Dict[str, Any], title: str = "Consent Compliance Report") -> bytes:
-    buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=landscape(A4), leftMargin=24, rightMargin=24, topMargin=24, bottomMargin=24)
-    styles = getSampleStyleSheet(); cell_style = _pdf_cell_style(styles)
-    elems: List[Any] = []
-
-    summ = compliance_summary(df, meta)
-    window = summ["consent_window_ms"]
-    window_txt = "Unknown" if window is None else f"{window/1000:.2f}s"
-
     elems.append(Paragraph(title, styles["Heading2"]))
-    elems.append(Paragraph(
-        f"Status: <b>{summ['status']}</b> · Total: {summ['total_requests']} · Pre-consent: {summ['preconsent_requests']} "
-        f"· Violations: {summ['violation_count']} · High-Risk: <b>{summ['highrisk_count']}</b> · Pre-consent window: <b>{window_txt}</b>",
-        styles["Normal"]
-    ))
     elems.append(Spacer(1, 6))
-    elems.append(Paragraph(
-        "<b>Explanation:</b> Rows highlighted in <font color='white' bgcolor='red'>RED</font> are non-essential or policy-blocked requests "
-        "that fired <b>before user consent was stored</b> (High-Risk).", styles["Normal"]
-    ))
+
+    vcount = int(df["Violation"].sum()) if not df.empty and "Violation" in df.columns else 0
+    elems.append(Paragraph(f"Violations detected: <b>{vcount}</b>", styles["Normal"]))
     elems.append(Spacer(1, 8))
 
-    # Cookies set before consent
-    cookies_df = preconsent_cookie_summary(df)
-    elems.append(Paragraph("<b>Cookies set before consent</b>", styles["Heading4"]))
-    if cookies_df.empty:
-        elems.append(Paragraph("None detected.", styles["Normal"]))
+    # Requests table
+    cols = ["Seq #","Name","Status","Type","Category","PolicyCat","Essential","PreConsent","Violation"]
+    if not df.empty:
+        header = cols
+        chunk = 20
+        for start in range(0, len(df), chunk):
+            part = df.iloc[start:start+chunk].copy()
+            data = [header]
+            for _, r in part.iterrows():
+                name = Paragraph(_soft_wrap_text(str(r["Name"])), cell_style)
+                typ = Paragraph(_soft_wrap_text(str(r.get("Type","")), 200), cell_style)
+                data.append([
+                    str(r["Seq #"]), name, str(r["Status"]), typ,
+                    str(r["Category"]), str(r["PolicyCat"]), str(r["Essential"]),
+                    str(r["PreConsent"]), str(r["Violation"])
+                ])
+            tbl = _pdf_table(data, [32, None, 36, 60, 60, 64, 50, 60, 50])
+            # color rows (red = violation)
+            for ridx in range(1, len(data)):
+                row = part.iloc[ridx-1]
+                if bool(row.get("Violation", False)):
+                    tbl.setStyle(TableStyle([("BACKGROUND", (0, ridx), (-1, ridx), colors.HexColor(VIOLATION_COLOR))]))
+            elems.append(tbl)
     else:
-        ccols = ["Cookie","Purpose","First Seq #","Domain","Times Set"]
-        data_c = [ccols] + cookies_df[ccols].astype(str).values.tolist()
-        table_c = Table(data_c, colWidths=[180, 80, 60, 240, 60])
-        style_c = TableStyle([
-            ("BACKGROUND", (0,0), (-1,0), colors.black),
-            ("TEXTCOLOR", (0,0), (-1,0), colors.white),
-            ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
-            ("FONTSIZE", (0,0), (-1,0), 9),
-            ("GRID", (0,0), (-1,-1), 0.25, colors.HexColor("#2A2F34")),
-            ("FONTSIZE", (0,1), (-1,-1), 8),
-            ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
-            ("LEFTPADDING", (0,0), (-1,-1), 6),
-            ("RIGHTPADDING", (0,0), (-1,-1), 6),
-            ("ALIGN", (2,1), (2,-1), "CENTER"),
-            ("ALIGN", (4,1), (4,-1), "CENTER"),
-        ])
-        table_c.setStyle(style_c)
-        elems.append(table_c)
+        elems.append(Paragraph("No requests parsed.", styles["Italic"]))
     elems.append(Spacer(1, 8))
 
-    # 3P Pre-consent by domain
-    elems.append(Paragraph("<b>Third-party requests before consent (Top domains)</b>", styles["Heading4"]))
-    third = summ["preconsent_3p_domains"]
-    if not third:
-        elems.append(Paragraph("None detected.", styles["Normal"]))
+    # Cookies
+    elems.append(Paragraph("Cookies", styles["Heading4"]))
+    if cookies_df is None or cookies_df.empty:
+        elems.append(Paragraph("No cookies detected (or redacted by browser export).", styles["Normal"]))
     else:
-        ddata = [["Domain", "Count"]] + [[k, str(v)] for k, v in third.items()]
-        dtable = Table(ddata, colWidths=[300, 60])
-        dtable.setStyle(TableStyle([
-            ("BACKGROUND", (0,0), (-1,0), colors.black),
-            ("TEXTCOLOR", (0,0), (-1,0), colors.white),
-            ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
-            ("GRID", (0,0), (-1,-1), 0.25, colors.HexColor("#2A2F34")),
-            ("FONTSIZE", (0,0), (-1,0), 9),
-            ("FONTSIZE", (0,1), (-1,-1), 8),
-        ]))
-        elems.append(dtable)
-    elems.append(Spacer(1, 8))
-
-    # Tag chains (parent -> child)
-    elems.append(Paragraph("<b>Tag Chains (Top)</b>", styles["Heading4"]))
-    edges_df, chains = build_tag_graph(df)
-    if chains.empty:
-        elems.append(Paragraph("No initiator information found in HAR.", styles["Normal"]))
-    else:
-        top = chains.head(15)
-        ccols = ["Parent", "Child", "Purpose", "Count", "PreConsent", "FirstSeq"]
-        data_g = [ccols] + top[ccols].astype(str).values.tolist()
-        table_g = Table(data_g, colWidths=[200, 220, 80, 48, 72, 50])
-        table_g.setStyle(TableStyle([
-            ("BACKGROUND", (0,0), (-1,0), colors.black),
-            ("TEXTCOLOR", (0,0), (-1,0), colors.white),
-            ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
-            ("FONTSIZE", (0,0), (-1,0), 9),
-            ("GRID", (0,0), (-1,-1), 0.25, colors.HexColor("#2A2F34")),
-            ("FONTSIZE", (0,1), (-1,-1), 8),
-            ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
-            ("LEFTPADDING", (0,0), (-1,-1), 6),
-            ("RIGHTPADDING", (0,0), (-1,-1), 6),
-            ("ALIGN", (3,1), (4,-1), "CENTER"),
-            ("ALIGN", (5,1), (5,-1), "CENTER"),
-        ]))
-        elems.append(table_g)
-    elems.append(Spacer(1, 10))
-
-    # High-Risk table
-    viol = df[df["HighRisk"] == True]  # noqa: E712
-    cols = ["Seq #","Name","Status","Type","Started at","Category","Purpose","Party","Rule"]
-
-    data = [cols]
-    if viol.empty:
-        data.append(["", "No high-risk requests detected.", "", "", "", "", "", "", ""])
-    else:
-        for _, row in viol[cols].iterrows():
-            data.append([
-                str(row["Seq #"]),
-                Paragraph(html_escape(_soft_wrap_text(row["Name"])), cell_style),
-                str(row["Status"]),
-                Paragraph(html_escape(_soft_wrap_text(row["Type"], max_len=200)), cell_style),
-                str(row["Started at"]),
-                str(row["Category"]),
-                str(row["Purpose"]),
-                str(row["Party"]),
-                str(row["Rule"]),
-            ])
-
-    col_widths = [32, None, 36, 46, 52, 52, 52, 30, 52]
-    table = Table(data, repeatRows=1, colWidths=col_widths)
-    base = TableStyle(
-        [
-            ("BACKGROUND", (0, 0), (-1, 0), colors.black),
-            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, 0), 10),
-            ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#2A2F34")),
-            ("FONTSIZE", (0, 1), (-1, -1), 8),
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("LEFTPADDING", (0, 0), (-1, -1), 6),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-            ("ALIGN", (0, 1), (0, -1), "CENTER"),
-            ("LEFTPADDING", (0, 1), (0, -1), 4),
-            ("RIGHTPADDING", (0, 1), (0, -1), 4),
-        ]
-    )
-    if not viol.empty:
-        for i in range(1, len(data)):
-            base.add("BACKGROUND", (0, i), (-1, i), colors.red)
-            base.add("TEXTCOLOR", (0, i), (-1, i), colors.white)
-    table.setStyle(base)
-    elems.append(table)
+        ccols = ["Cookie","Domain","PolicyCat","Essential","First Seq #","PreConsent","Violation","Source"]
+        chunk = 26
+        for start in range(0, len(cookies_df), chunk):
+            ck = cookies_df.iloc[start:start+chunk].copy()
+            data_c = [ccols] + ck[ccols].astype(str).values.tolist()
+            tbl = _pdf_table(data_c, [160, 180, 80, 60, 60, 60, 60, 80])
+            for ridx in range(1, len(data_c)):
+                row = ck.iloc[ridx-1]
+                if bool(row.get("Violation", False)):
+                    tbl.setStyle(TableStyle([("BACKGROUND", (0, ridx), (-1, ridx), colors.HexColor(VIOLATION_COLOR))]))
+                elif bool(row.get("PreConsent", False)):
+                    tbl.setStyle(TableStyle([("BACKGROUND", (0, ridx), (-1, ridx), colors.HexColor(PRECONSENT_FILL))]))
+            elems.append(tbl)
 
     doc.build(elems)
-    buf.seek(0)
-    return buf.read()
+    return buf.getvalue()
 
-# -------------------- Compliance XLSX --------------------
-def make_report_xlsx(df: pd.DataFrame, meta: Dict[str, Any], title: str = "Consent Compliance Report") -> bytes:
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter", engine_kwargs={"options": {"strings_to_urls": False}}) as writer:
-        wb = writer.book
-
-        summ = compliance_summary(df, meta)
-        ws = wb.add_worksheet("Summary")
-        hfmt = wb.add_format({"bold": True})
-        ws.write(0, 0, title, wb.add_format({"bold": True, "font_size": 14}))
-
-        explanation = (
-            "Explanation: Rows highlighted in RED in the 'High-Risk' sheet are non-essential or policy-blocked "
-            "requests that fired BEFORE user consent was stored."
-        )
-        wrap = wb.add_format({"text_wrap": True})
-        ws.write(1, 0, explanation, wrap); ws.set_row(1, 48)
-
-        window = summ["consent_window_ms"]
-        window_txt = "Unknown" if window is None else f"{window/1000:.2f}s"
-
-        for i, (k, v) in enumerate([
-            ("Status", summ["status"]),
-            ("Total requests", summ["total_requests"]),
-            ("Pre-consent requests", summ["preconsent_requests"]),
-            ("Violations (generic)", summ["violation_count"]),
-            ("High-Risk (policy)", summ["highrisk_count"]),
-            ("Pre-consent window", window_txt),
-        ], start=3):
-            ws.write(i, 0, k, hfmt); ws.write(i, 1, v)
-
-        ws.write(10, 0, "3P pre-consent (top domains)", hfmt)
-        r = 11
-        for dom, cnt in summ["preconsent_3p_domains"].items():
-            ws.write(r, 0, dom); ws.write(r, 1, cnt); r += 1
-
-        ws.write(10, 3, "High-Risk purposes", hfmt)
-        r2 = 11
-        for p, cnt in summ["highrisk_purposes"].items():
-            ws.write(r2, 3, p); ws.write(r2, 4, cnt); r2 += 1
-
-        ws.set_column(0, 0, 44); ws.set_column(1, 1, 16); ws.set_column(3, 3, 24); ws.set_column(4, 4, 12)
-
-        # High-Risk sheet
-        viol = df[df["HighRisk"] == True]  # noqa: E712
-        cols = ["Seq #","Name","Status","Type","Started at","Category","Purpose","Party","Rule"]
-        if viol.empty:
-            pd.DataFrame([{"Info":"No high-risk requests detected."}]).to_excel(writer, sheet_name="High-Risk", index=False)
-        else:
-            viol[cols].to_excel(writer, sheet_name="High-Risk", index=False)
-            ws2 = writer.sheets["High-Risk"]
-            start_row = 1
-            red_fmt = wb.add_format({"bg_color": "#FF0000", "font_color": "#FFFFFF"})
-            for i in range(len(viol)):
-                ws2.set_row(start_row + i, None, red_fmt)
-            ws2.set_column(0, 0, 8); ws2.set_column(1, 1, 90); ws2.set_column(2, 8, 16)
-
-        # Pre-consent cookies sheet
-        cookies_df = preconsent_cookie_summary(df)
-        if cookies_df.empty:
-            pd.DataFrame([{"Cookie": "None detected"}]).to_excel(writer, sheet_name="PreConsent Cookies", index=False)
-        else:
-            cols = ["Cookie","Purpose","First Seq #","Domain","Times Set"]
-            cookies_df[cols].to_excel(writer, sheet_name="PreConsent Cookies", index=False)
-            ws3 = writer.sheets["PreConsent Cookies"]
-            ws3.set_column(0, 0, 34); ws3.set_column(1, 1, 14); ws3.set_column(2, 2, 12); ws3.set_column(3, 3, 40); ws3.set_column(4, 4, 12)
-
-        # Tag Chains sheet (TOP 15)
-        edges_df, chains = build_tag_graph(df)
-        if chains.empty:
-            pd.DataFrame([{"Info": "No initiator information found in HAR."}]).to_excel(
-                writer, sheet_name="Tag Chains", index=False
-            )
-        else:
-            cols_tc = ["Parent", "Child", "Purpose", "Count", "PreConsent", "FirstSeq"]
-            top_tc = chains[cols_tc].head(15)
-            top_tc.to_excel(writer, sheet_name="Tag Chains", index=False)
-            ws_tc = writer.sheets["Tag Chains"]
-            header_fmt = wb.add_format({"bold": True, "bg_color": "#000000", "font_color": "#FFFFFF", "border": 1})
-            for i, col in enumerate(cols_tc):
-                ws_tc.write(0, i, col, header_fmt)
-            ws_tc.set_column(0, 0, 40); ws_tc.set_column(1, 1, 44)
-            ws_tc.set_column(2, 2, 14); ws_tc.set_column(3, 5, 12)
-
-    output.seek(0)
-    return output.read()
-
-# -------------------- Evidence pack --------------------
-def make_evidence_zip(har_bytes: bytes, rules_text: str, df: pd.DataFrame, meta: Dict[str, Any]) -> bytes:
-    mem = io.BytesIO()
-    with zipfile.ZipFile(mem, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        # Originals & policy
-        z.writestr("evidence/original.har", har_bytes if isinstance(har_bytes, (bytes, bytearray)) else har_bytes.encode("utf-8", "ignore"))
-        if rules_text:
-            z.writestr("evidence/policy.yml", rules_text)
-
-        # Reports
-        z.writestr("reports/compliance.pdf", make_report_pdf(df, meta))
-        z.writestr("reports/compliance.xlsx", make_report_xlsx(df, meta))
-
-        # Summaries
-        summ = compliance_summary(df, meta)
-        z.writestr("snapshot/summary.json", json.dumps(summ, indent=2))
-
-        # One-page breakdown PDF
-        try:
-            z.writestr("reports/breakdown.pdf", make_breakdown_pdf(summ))
-        except Exception:
-            pass
-
-        # Data dumps
-        try:
-            csv_cols = ["Seq #","Name","Host","InitiatorHost","Status","Type","Started at","Size","Time","Category","Purpose","Party","PreConsent","Violation","HighRisk","Rule","CookiesSetNames"]
-            z.writestr("data/requests.csv", df[csv_cols].to_csv(index=False))
-        except Exception:
-            pass
-        try:
-            cookies_df = preconsent_cookie_summary(df)
-            z.writestr("data/preconsent_cookies.json", cookies_df.to_json(orient="records"))
-        except Exception:
-            pass
-
-        # Tag graph JSON
-        try:
-            edges_df, chains = build_tag_graph(df)
-            z.writestr("graph/tag_chains.json", edges_df.to_json(orient="records"))
-            z.writestr("graph/tag_chains_agg.json", chains.to_json(orient="records"))
-        except Exception:
-            pass
-
-        # Interpretation guide
-        z.writestr("INTERPRET_REPORT.md", INTERPRET_GUIDE)
-
-    mem.seek(0)
-    return mem.read()
-
-# -------------------- Processing Helper --------------------
-def process_har(har_bytes: bytes, policy_text: str, assume_no_consent_if_unknown: bool, strict_mode: bool) -> tuple[pd.DataFrame, Dict[str, Any]]:
-    try:
-        har_json = json.loads(har_bytes.decode("utf-8", "ignore"))
-    except Exception as e:
-        raise ValueError(f"Invalid HAR: {e}")
-    df = har_to_df(har_json)
-    if df.empty:
-        return df, {"has_consent": False, "preconsent_window_ms": None}
-    df, meta = mark_preconsent(df, assume_no_consent_if_unknown)
-    df = mark_party(df)
-    rules = load_rules_from_text(policy_text) if policy_text else DEFAULT_RULES.copy()
-    df = apply_policy(df, rules, strict_mode=strict_mode)
-    return df, meta
-
-# -------------------- Diff utilities --------------------
-def diff_requests(test_df: pd.DataFrame, base_df: pd.DataFrame) -> pd.DataFrame:
-    base_urls = set(base_df["Name"].astype(str).unique())
-    is_new = ~test_df["Name"].astype(str).isin(base_urls)
-    new_df = test_df[is_new].copy()
-    return new_df.sort_values(["Seq #"])
-
-def diff_cookies(test_df: pd.DataFrame, base_df: pd.DataFrame) -> pd.DataFrame:
-    t = preconsent_cookie_summary(test_df); b = preconsent_cookie_summary(base_df)
-    if t.empty:
-        return t
-    if b.empty:
-        return t
-    keys_b = set(zip(b["Cookie"], b["Domain"]))
-    mask = [(r["Cookie"], r["Domain"]) not in keys_b for _, r in t.iterrows()]
-    return t[mask].reset_index(drop=True)
-
-def diff_tag_chains(test_df: pd.DataFrame, base_df: pd.DataFrame) -> pd.DataFrame:
-    _, agg_t = build_tag_graph(test_df)
-    _, agg_b = build_tag_graph(base_df)
-    if agg_t.empty:
-        return agg_t
-    if agg_b.empty:
-        return agg_t
-    keys_b = set((r.Parent, r.Child, r.Purpose) for r in agg_b.itertuples(index=False))
-    rows = [r for r in agg_t.itertuples(index=False) if (r.Parent, r.Child, r.Purpose) not in keys_b]
-    return pd.DataFrame(rows, columns=agg_t.columns)
-
-# -------------------- Diff Exports --------------------
-def make_diff_pdf(new_req: pd.DataFrame, new_cookies: pd.DataFrame, new_chains: pd.DataFrame, tag_name: str = "Differences vs Baseline") -> bytes:
-    buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=landscape(A4), leftMargin=24,rightMargin=24,topMargin=24,bottomMargin=24)
-    styles = getSampleStyleSheet(); cell_style = _pdf_cell_style(styles); elems = []
-    elems.append(Paragraph(f"HAR Diff Report – {tag_name}", styles["Heading2"]))
-    elems.append(Paragraph("This report shows differences between a baseline HAR (all tags paused) and a test HAR (one tag enabled).", styles["Normal"]))
-    elems.append(Spacer(1,8))
-
-    elems.append(Paragraph("<b>Requests – Differences vs Baseline</b>", styles["Heading4"]))
-    if new_req.empty:
-        elems.append(Paragraph("No added requests detected.", styles["Normal"]))
-    else:
-        cols=["Seq #","Name","Status","Type","Category","Purpose","Party","PreConsent","Violation","HighRisk","Rule"]
-        data=[cols]
-        for _,row in new_req[cols].iterrows():
-            data.append([str(row["Seq #"]),
-                         Paragraph(html_escape(_soft_wrap_text(row["Name"])), cell_style),
-                         str(row["Status"]), Paragraph(html_escape(_soft_wrap_text(row["Type"],200)), cell_style),
-                         str(row["Category"]), str(row["Purpose"]), str(row["Party"]),
-                         str(row["PreConsent"]), str(row["Violation"]), str(row["HighRisk"]), str(row["Rule"])])
-        table=Table(data, repeatRows=1, colWidths=[32,None,40,56,56,60,40,56,48,48,56])
-        table.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.black),("TEXTCOLOR",(0,0),(-1,0),colors.white),
-                                   ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("FONTSIZE",(0,0),(-1,0),10),
-                                   ("GRID",(0,0),(-1,-1),0.25,colors.HexColor("#2A2F34")),("FONTSIZE",(0,1),(-1,-1),8),
-                                   ("VALIGN",(0,0),(-1,-1),"MIDDLE"),("LEFTPADDING",(0,0),(-1,-1),6),("RIGHTPADDING",(0,0),(-1,-1),6)]))
-        elems.append(table)
-    elems.append(Spacer(1,8))
-
-    elems.append(Paragraph("<b>Pre-consent Cookies – Differences vs Baseline</b>", styles["Heading4"]))
-    if new_cookies is None or new_cookies.empty:
-        elems.append(Paragraph("None detected.", styles["Normal"]))
-    else:
-        ccols=["Cookie","Purpose","First Seq #","Domain","Times Set"]
-        data_c=[ccols]+new_cookies[ccols].astype(str).values.tolist()
-        table_c=Table(data_c, colWidths=[180,80,60,240,60])
-        table_c.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.black),("TEXTCOLOR",(0,0),(-1,0),colors.white),
-                                     ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("FONTSIZE",(0,0),(-1,0),9),
-                                     ("GRID",(0,0),(-1,-1),0.25,colors.HexColor("#2A2F34")),("FONTSIZE",(0,1),(-1,-1),8)]))
-        elems.append(table_c)
-    elems.append(Spacer(1,8))
-
-    elems.append(Paragraph("<b>Tag Chains – Differences vs Baseline</b>", styles["Heading4"]))
-    if new_chains is None or new_chains.empty:
-        elems.append(Paragraph("No added parent→child tag edges detected.", styles["Normal"]))
-    else:
-        cols_tc=["Parent","Child","Purpose","Count","PreConsent","FirstSeq"]
-        top=new_chains[cols_tc].head(20)
-        data_g=[cols_tc]+top.astype(str).values.tolist()
-        table_g=Table(data_g, colWidths=[200,220,80,48,72,50])
-        table_g.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.black),("TEXTCOLOR",(0,0),(-1,0),colors.white),
-                                     ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("FONTSIZE",(0,0),(-1,0),9),
-                                     ("GRID",(0,0),(-1,-1),0.25,colors.HexColor("#2A2F34")),("FONTSIZE",(0,1),(-1,-1),8)]))
-        elems.append(table_g)
-
-    doc.build(elems); buf.seek(0); return buf.read()
-
-def make_diff_xlsx(new_req: pd.DataFrame, new_cookies: pd.DataFrame, new_chains: pd.DataFrame, title: str = "HAR Diff Report") -> bytes:
-    output=io.BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter", engine_kwargs={"options":{"strings_to_urls":False}}) as writer:
-        wb=writer.book
-        ws=wb.add_worksheet("Summary")
-        ws.write(0,0,title, wb.add_format({"bold":True,"font_size":14}))
-        ws.write(2,0,"Requests: Added vs Baseline", wb.add_format({"bold":True}))
-        ws.write(2,1,0 if new_req is None else len(new_req))
-        ws.write(3,0,"Pre-consent Cookies: Added vs Baseline", wb.add_format({"bold":True}))
-        ws.write(3,1,0 if (new_cookies is None or new_cookies.empty) else len(new_cookies))
-        ws.write(4,0,"Tag Chains: Added vs Baseline", wb.add_format({"bold":True}))
-        ws.write(4,1,0 if (new_chains is None or new_chains.empty) else len(new_chains))
-
-        if new_req is None or new_req.empty:
-            pd.DataFrame([{"Info":"No added requests."}]).to_excel(writer, sheet_name="Requests vs Baseline (Added)", index=False)
-        else:
-            cols=["Seq #","Name","Status","Type","Category","Purpose","Party","PreConsent","Violation","HighRisk","Rule"]
-            new_req[cols].to_excel(writer, sheet_name="Requests vs Baseline (Added)", index=False)
-            ws1=writer.sheets["Requests vs Baseline (Added)"]; ws1.set_column(0,0,8); ws1.set_column(1,1,90); ws1.set_column(2,10,16)
-
-        if new_cookies is None or new_cookies.empty:
-            pd.DataFrame([{"Info":"No added cookies."}]).to_excel(writer, sheet_name="Cookies vs Baseline (Added)", index=False)
-        else:
-            cols=["Cookie","Purpose","First Seq #","Domain","Times Set"]
-            new_cookies[cols].to_excel(writer, sheet_name="Cookies vs Baseline (Added)", index=False)
-            ws2=writer.sheets["Cookies vs Baseline (Added)"]; ws2.set_column(0,0,34); ws2.set_column(1,1,14); ws2.set_column(2,2,12); ws2.set_column(3,3,40); ws2.set_column(4,4,12)
-
-        if new_chains is None or new_chains.empty:
-            pd.DataFrame([{"Info":"No added tag chains."}]).to_excel(writer, sheet_name="Tag Chains vs Baseline (Added)", index=False)
-        else:
-            cols_tc=["Parent","Child","Purpose","Count","PreConsent","FirstSeq"]
-            new_chains[cols_tc].to_excel(writer, sheet_name="Tag Chains vs Baseline (Added)", index=False)
-            ws3=writer.sheets["Tag Chains vs Baseline (Added)"]; ws3.set_column(0,0,40); ws3.set_column(1,1,44); ws3.set_column(2,2,14); ws3.set_column(3,5,12)
-    output.seek(0); return output.read()
-
-# -------------------- Streamlit UI --------------------
-st.set_page_config(page_title="HAR File Viewer", layout="wide")
-
-st.markdown(
-    """
-    <style>
-      .block-container { padding-top: 1rem; }
-      .legend-chip { display:inline-block; padding:4px 8px; border-radius:999px; color:#0b0f14; font-weight:600; margin-right:6px; }
-      .stDataFrame table { font-size: 12px; }
-    </style>
-    """,
-    unsafe_allow_html=True
-)
-
-st.title("HAR File Viewer")
-
-with st.expander("📖 View Guide – How to interpret this report", expanded=False):
-    st.markdown(INTERPRET_GUIDE)
+# =============================== UI ===============================
+st.title("Tag Audit Tool (HAR Analyzer)")
 
 with st.sidebar:
-    st.header("Load HAR")
-    uploaded = st.file_uploader("Upload a .har file", type=["har"])
-    st.caption("Export a HAR from DevTools → Network → ⋯ → Save all as HAR")
-
-    st.markdown("### Compliance Options")
-    assume_no_consent_if_unknown = st.checkbox("Assume NO consent if none detected", value=True)
-    strict_mode = st.checkbox("Strict mode (all 3P blocked pre-consent unless allowlisted)", value=True)
-
-    st.markdown("### Policy (YAML)")
-    policy_file = st.file_uploader("policy.yml (optional)", type=["yml", "yaml"], help="Keys: allow, block_until_consent, purpose_overrides, cookie_overrides")
-    policy_text = policy_file.read().decode("utf-8", "ignore") if policy_file else ""
-
-    st.markdown("### Export Results")
-
-with st.sidebar:
-    st.markdown("---")
-    st.header("Diff Mode (Optional)")
-    base_har = st.file_uploader("Baseline HAR (all tags paused)", type=["har"], key="baseline_har")
-    test_har = st.file_uploader("Test HAR (one tag enabled)", type=["har"], key="test_har")
-    tag_label = st.text_input("Label for this comparison (e.g., 'Google Ads Remarketing')", value="Differences vs Baseline")
-
-# Guard
-if uploaded is None and (base_har is None or test_har is None):
-    st.info("Upload a HAR file to get started. For Diff Mode, upload both a Baseline and a Test HAR.")
-    st.stop()
-
-# ---------- Single HAR mode ----------
-if uploaded is not None and not (base_har and test_har):
-    raw_har_bytes = uploaded.read()
-    try:
-        df, meta = process_har(raw_har_bytes, policy_text, assume_no_consent_if_unknown, strict_mode)
-    except Exception as e:
-        st.error(f"Failed to read HAR: {e}")
-        st.stop()
-
-    if df.empty:
-        st.warning("No entries found in this HAR.")
-        st.stop()
-
-    # Category filter chips
-    st.subheader("Requests")
-    cols_btn = st.columns(len(CATEGORY_ORDER))
-    clicked = None
-    for i, c in enumerate(CATEGORY_ORDER):
-        if c == "All":
-            count = len(df)
-        elif c == "High-Risk":
-            count = int(df["HighRisk"].sum())
-        else:
-            count = int((df["Category"] == c).sum())
-        if cols_btn[i].button(f"{c} ({count})", use_container_width=True, key=f"cat_{c}"):
-            clicked = c
-    if "cat_selected" not in st.session_state:
-        st.session_state["cat_selected"] = "All"
-    if clicked:
-        st.session_state["cat_selected"] = clicked
-    selected = st.session_state["cat_selected"]
-
-    filtered = filter_df(df, selected)
-
-    legend_html = " ".join(
-        f'<span class="legend-chip" style="background:{CATEGORY_COLORS.get(cat, FALLBACK_COLOR)};">{cat}</span>'
-        for cat in ["XHR","JS","CSS","Img","Media","Other","Errors"]
-    )
-    st.markdown(f"**Legend:** {legend_html}", unsafe_allow_html=True)
-
-    window = meta.get("preconsent_window_ms")
-    window_txt = "Unknown" if window is None else f"{window/1000:.2f}s"
-    st.caption(f"Showing **{len(filtered)}** of **{len(df)}** · Category: **{selected}** · Pre-consent window: **{window_txt}**")
-
-    # Sidebar exports for single HAR
-    with st.sidebar:
-        csv_cols = ["Seq #","Name","Host","Status","Type","Started at","Size","Time","Category","Purpose","Party","PreConsent","Violation","HighRisk","Rule","CookiePurposeHint","ConsentModeHint","CookiesSetNames","ColorHex","InitiatorHost"]
-        st.download_button("⬇️ CSV (no colors)", data=filtered[csv_cols].to_csv(index=False).encode("utf-8"),
-                           file_name="har_export.csv", mime="text/csv", key="dl_csv_single")
-
-        st.download_button("⬇️ Excel (colored)", data=make_xlsx(filtered, title=f"HAR Export – {selected}"),
-                           file_name="har_export.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_xlsx_single")
-
-        st.download_button("⬇️ PDF (colored)", data=make_pdf(filtered, title=f"HAR Export – {selected}"),
-                           file_name="har_export.pdf", mime="application/pdf", key="dl_pdf_single")
-
-        st.markdown("---")
-        st.download_button("🛡️ Compliance XLSX", data=make_report_xlsx(df, meta, title="Consent Compliance Report"),
-                           file_name="compliance_report.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_comp_xlsx")
-
-        st.download_button("🛡️ Compliance PDF", data=make_report_pdf(df, meta, title="Consent Compliance Report"),
-                           file_name="compliance_report.pdf", mime="application/pdf", key="dl_comp_pdf")
-
-        try:
-            onepager_bytes = make_breakdown_pdf(compliance_summary(df, meta))
-            st.download_button("🧾 One-Page Breakdown (PDF)", data=onepager_bytes,
-                               file_name="compliance_breakdown.pdf", mime="application/pdf", key="dl_onepager")
-        except Exception as e:
-            st.caption(f"One-pager unavailable: {e}")
-
-        try:
-            st.download_button("📦 Evidence Pack (.zip)", data=make_evidence_zip(raw_har_bytes, policy_text, df, meta),
-                               file_name="evidence_pack.zip", mime="application/zip", key="dl_evidence_zip")
-        except Exception as e:
-            st.caption(f"Evidence pack unavailable: {e}")
-
-    # Styled table
-    show_cols = [
-        "Seq #","Name","InitiatorHost","Status","Type","Started at","Size","Time",
-        "Category","Purpose","Party","PreConsent","Violation","HighRisk","Rule","ColorHex","CookiePurposeHint"
-    ]
-    show_df = filtered[show_cols].copy()
-    row_colors = show_df["ColorHex"].copy()
-    display_df = show_df.drop(columns=["ColorHex"])
-
-    def apply_row_colors(s: pd.Series):
-        col = row_colors.loc[s.name]
-        is_hr = str(display_df.loc[s.name, "HighRisk"]) == "True"
-        txt_color = "#FFFFFF" if is_hr and selected == "High-Risk" else "#0b0f14"
-        return [f"background-color: {col}; color: {txt_color};"] * len(s)
-
-    st.dataframe(display_df.style.apply(apply_row_colors, axis=1), use_container_width=True, hide_index=True)
-
-# ---------- Diff Mode ----------
-if base_har is not None and test_har is not None:
-    try:
-        base_df, base_meta = process_har(base_har.read(), policy_text, assume_no_consent_if_unknown, strict_mode)
-        test_df, test_meta = process_har(test_har.read(), policy_text, assume_no_consent_if_unknown, strict_mode)
-    except Exception as e:
-        st.error(f"Failed to process one of the HAR files: {e}")
-        st.stop()
-
-    if base_df.empty or test_df.empty:
-        st.warning("One of the HAR files has no entries.")
+    st.markdown("**Export a HAR from DevTools → Network → ⋯ → Save all as HAR**")
+    st.markdown("Upload a single HAR, or enable Diff Mode to compare **Baseline** vs **Test**.")
+    st.divider()
+    diff_mode = st.checkbox("Diff Mode (Baseline vs Test)", value=False)
+    baseline = None
+    test = None
+    if diff_mode:
+        baseline = st.file_uploader("Baseline HAR (all tags paused)", type=["har"], key="baseline_har")
+        test = st.file_uploader("Test HAR (tag enabled)", type=["har"], key="test_har")
     else:
-        new_req = diff_requests(test_df, base_df)
-        new_cookies = diff_cookies(test_df, base_df)
-        new_chains = diff_tag_chains(test_df, base_df)
+        har_file = st.file_uploader("HAR file", type=["har"], key="single_har")
 
-        st.markdown("---")
-        st.header(f"🔍 Diff Mode — {tag_label}")
+    st.divider()
+    use_builtin_policy = st.checkbox("Use built-in Google Essential policy", value=True,
+                                     help="Marks common Google domains & cookies as Essential by default.")
+    st.caption("Consent boundary decides what counts as **pre-consent** (Seq # < boundary).")
+    consent_seq_ui = st.number_input("Consent Boundary (Seq #)", min_value=1, value=999999, step=1)
+
+    st.divider()
+    exp_csv = st.empty()
+    exp_xlsx = st.empty()
+    exp_pdf = st.empty()
+
+def load_har(file) -> dict:
+    if not file:
+        return {}
+    try:
+        raw = file.read()
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="ignore")
+        return json.loads(raw)
+    except Exception:
+        try:
+            file.seek(0)
+            return json.load(file)
+        except Exception:
+            return {}
+
+# =============================== FLOW ===============================
+if not diff_mode:
+    if 'har_file' in locals() and har_file:
+        har_json = load_har(har_file)
+        maybe_warn_har_creator(har_json)
+
+        entries = (har_json or {}).get("log", {}).get("entries", []) or []
+        boundary = consent_seq_ui if consent_seq_ui < 999999 else estimate_consent_boundary(entries)
+
+        # policy
+        POLICY = Policy()
+        POLICY.load_builtins(enable=use_builtin_policy)
+
+        # requests
+        df = har_to_df(har_json, POLICY, boundary)
+
+        # cookies (merge sources)
+        cookies = harvest_cookies(har_json, POLICY, boundary)
+        cookies = dedup(cookies, infer_client_cookies(har_json, POLICY, boundary))
+        cookies = dedup(cookies, infer_js_cookie_writes(har_json, POLICY, boundary))
+
+        # tag chains + summary
+        chains = build_tag_chains(har_json, df)
+        parents = top_parents_summary(chains)
+
+        st.subheader("Requests")
+        st.caption(f"{len(df)} requests parsed · Consent boundary: {boundary} · Violations = Pre-consent & Non-Essential")
+        st.dataframe(style_dataframe(df), use_container_width=True, hide_index=True)
+
+        st.subheader("Cookies")
+        st.dataframe(cookies, use_container_width=True, hide_index=True)
+
+        st.subheader("Tag Chains")
+        st.dataframe(chains, use_container_width=True, hide_index=True)
+
+        st.subheader("Top Parents")
+        st.dataframe(parents, use_container_width=True, hide_index=True)
+
+        # exports
+        csv_bytes = to_csv_bytes(df)
+        xlsx_bytes = to_xlsx_bytes(df, cookies, chains, parents, title="HAR Export (Single)")
+        pdf_bytes = to_pdf_bytes(df, cookies, title="HAR Export – Single")
+
+        with st.sidebar:
+            exp_csv.download_button("CSV (no colors)", data=csv_bytes, file_name="har_export.csv", mime="text/csv")
+            exp_xlsx.download_button("Excel (colored)", data=xlsx_bytes, file_name="har_export.xlsx",
+                                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            exp_pdf.download_button("PDF (colored)", data=pdf_bytes, file_name="har_export.pdf", mime="application/pdf")
+else:
+    if baseline and test:
+        har_base = load_har(baseline)
+        har_test = load_har(test)
+
+        maybe_warn_har_creator(har_base)
+        maybe_warn_har_creator(har_test)
+
+        entries_test = (har_test or {}).get("log", {}).get("entries", []) or []
+        boundary = consent_seq_ui if consent_seq_ui < 999999 else estimate_consent_boundary(entries_test)
+
+        # policy
+        POLICY = Policy()
+        POLICY.load_builtins(enable=use_builtin_policy)
+
+        # requests
+        df_base = har_to_df(har_base, POLICY, boundary)
+        df_test = har_to_df(har_test, POLICY, boundary)
+        df_added = diff_requests(df_base, df_test)
+
+        # cookies (merge) + diff
+        cookies_base = harvest_cookies(har_base, POLICY, boundary)
+        cookies_base = dedup(cookies_base, infer_client_cookies(har_base, POLICY, boundary))
+        cookies_base = dedup(cookies_base, infer_js_cookie_writes(har_base, POLICY, boundary))
+
+        cookies_test = harvest_cookies(har_test, POLICY, boundary)
+        cookies_test = dedup(cookies_test, infer_client_cookies(har_test, POLICY, boundary))
+        cookies_test = dedup(cookies_test, infer_js_cookie_writes(har_test, POLICY, boundary))
+
+        cookies_added = diff_cookies(cookies_base, cookies_test)
+
+        # chains from TEST (context for added) + host/URL match filter
+        chains_test = build_tag_chains(har_test, df_test)
+        added_urls = set(df_added["Name"].astype(str))
+        added_hosts = { _host_of(u) or u for u in added_urls }
+        child_keys = added_urls | added_hosts
+        if not chains_test.empty:
+            chains_added = chains_test[chains_test["Child"].isin(child_keys)].reset_index(drop=True)
+        else:
+            chains_added = chains_test
+
+        parents_added = top_parents_summary(chains_added)
 
         st.subheader("Requests: Added vs Baseline")
-        if new_req.empty:
-            st.info("No added requests detected.")
-        else:
-            st.dataframe(new_req[["Seq #","Name","Status","Type","Category","Purpose","Party","PreConsent","Violation","HighRisk","Rule"]],
-                         use_container_width=True)
+        st.caption(f"Baseline={len(df_base)} · Test={len(df_test)} · Added={len(df_added)} · Consent boundary: {boundary} · Violations = Pre-consent & Non-Essential")
+        st.dataframe(style_dataframe(df_added), use_container_width=True, hide_index=True)
 
-        st.subheader("Pre-consent Cookies: Added vs Baseline")
-        if new_cookies is None or new_cookies.empty:
-            st.info("No added pre-consent cookies detected.")
-        else:
-            st.dataframe(new_cookies, use_container_width=True)
+        st.subheader("Cookies: Added vs Baseline")
+        st.dataframe(cookies_added, use_container_width=True, hide_index=True)
 
-        st.subheader("Tag Chains: Added vs Baseline")
-        if new_chains is None or new_chains.empty:
-            st.info("No added parent→child tag edges detected.")
-        else:
-            st.dataframe(new_chains[["Parent","Child","Purpose","Count","PreConsent","FirstSeq"]], use_container_width=True)
+        st.subheader("Tag Chains (Added)")
+        st.dataframe(chains_added, use_container_width=True, hide_index=True)
 
-        # Downloads for Diff
+        st.subheader("Top Parents (Added)")
+        st.dataframe(parents_added, use_container_width=True, hide_index=True)
+
+        # exports
+        csv_bytes = to_csv_bytes(df_added)
+        xlsx_bytes = to_xlsx_bytes(df_added, cookies_added, chains_added, parents_added, title="Diff Report – Added vs Baseline")
+        pdf_bytes = to_pdf_bytes(df_added, cookies_added, title="Diff Report – Added vs Baseline")
+
         with st.sidebar:
-            st.markdown("---")
-            st.markdown("### Diff Exports")
-            st.download_button("⬇️ Diff PDF", data=make_diff_pdf(new_req, new_cookies, new_chains, tag_label or "Differences vs Baseline"),
-                               file_name="diff_report.pdf", mime="application/pdf", key="dl_diff_pdf")
-            st.download_button("⬇️ Diff XLSX", data=make_diff_xlsx(new_req, new_cookies, new_chains, "HAR Diff Report"),
-                               file_name="diff_report.xlsx",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_diff_xlsx")
+            exp_csv.download_button("CSV (no colors) – Diff", data=csv_bytes, file_name="diff_requests_added.csv", mime="text/csv")
+            exp_xlsx.download_button("Excel (colored) – Diff", data=xlsx_bytes, file_name="diff_report.xlsx",
+                                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            exp_pdf.download_button("PDF (colored) – Diff", data=pdf_bytes, file_name="diff_report.pdf", mime="application/pdf")
+    else:
+        st.info("Upload **both** Baseline and Test HAR files to view the diff.")
