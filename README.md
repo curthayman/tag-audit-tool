@@ -48,7 +48,7 @@ It detects **pre-consent** requests, classifies **tags & cookies** (with a built
 ## 📦 Installation
 
 ```bash
-git clone https://github.com/curthayman/tag-audit-tool.git
+https://github.com/curthayman/tag-audit-tool.git
 cd tag-audit-tool
 pip install -r requirements.txt
 ```
