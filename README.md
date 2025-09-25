@@ -3,7 +3,13 @@
 A **Streamlit** web app for auditing HAR (HTTP Archive) files with a focus on **consent compliance**.  
 It detects **pre-consent** requests, classifies **tags & cookies** (with a built-in policy that marks common Google surfaces as **Essential**), visualizes **tag chains**, and exports **CSV / Excel / PDF** reports. Includes a **Diff Mode** for comparing “baseline” vs “test” HARs (perfect for GTM tag enablement testing).
 
-![Screenshot](Screenshot.png)
+![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white)
+![Streamlit](https://img.shields.io/badge/Streamlit-1.36%2B-FF4B4B?logo=streamlit&logoColor=white)
+![Pandas](https://img.shields.io/badge/Pandas-2.2%2B-150458?logo=pandas&logoColor=white)
+![ReportLab](https://img.shields.io/badge/ReportLab-4.1%2B-orange)
+![XlsxWriter](https://img.shields.io/badge/XlsxWriter-3.2%2B-44B78B)
+![PyYAML](https://img.shields.io/badge/PyYAML-6.0%2B-yellow)
+![Pillow](https://img.shields.io/badge/Pillow-10.3%2B-green)
 
 ---
 
@@ -42,7 +48,7 @@ It detects **pre-consent** requests, classifies **tags & cookies** (with a built
 ## 📦 Installation
 
 ```bash
-git clone https://github.com/<you>/tag-audit-tool.git
+git clone https://github.com/curthayman/tag-audit-tool.git
 cd tag-audit-tool
 pip install -r requirements.txt
 ```
